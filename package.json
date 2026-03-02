@@ -1,0 +1,14 @@
+{
+  "name": "prime-bot",
+  "version": "1.0.0",
+  "description": "Prime Bot | Gorktimus Prime - token scan + risk score",
+  "main": "index.js",
+  "type": "module",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "dependencies": {
+    "axios": "^1.6.8",
+    "telegraf": "^4.16.3"
+  }
+}
