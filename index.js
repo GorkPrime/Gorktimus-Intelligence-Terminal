@@ -1,4 +1,5 @@
-const { Telegraf, Markup } = require("telegraf");
+console.log("🚨 NEW BUILD DEPLOYED 🚨");
+process.exit(1);const { Telegraf, Markup } = require("telegraf");
 const axios = require("axios");
 const fs = require("fs");
 const path = require("path");
