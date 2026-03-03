@@ -1,7 +1,7 @@
 {
   "name": "prime-bot",
   "version": "1.0.0",
-  "description": "Prime Bot | Gorktimus Prime - token scan + risk score",
+  "description": "Prime Bot - Token scanner, risk analyzer, price alerts, and Telegram moderator",
   "main": "index.js",
   "scripts": {
     "start": "node index.js"
@@ -10,7 +10,8 @@
     "node": ">=18"
   },
   "dependencies": {
-  Node cr    "axios": "^1.6.8",
+    "axios": "^1.6.8",
+    "node-cron": "^3.0.3",
     "telegraf": "^4.16.3"
   }
 }
