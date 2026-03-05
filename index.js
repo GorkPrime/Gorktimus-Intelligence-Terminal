@@ -3,25 +3,30 @@
 const TelegramBot = require("node-telegram-bot-api");
 const sqlite3 = require("sqlite3").verbose();
 const axios = require("axios");
+const path = require("path");
 
-const token =
+// ===================== ENV =====================
+const BOT_TOKEN =
   process.env.TELEGRAM_BOT_TOKEN ||
   process.env.BOT_TOKEN ||
   process.env.TOKEN;
 
-if (!token) {
+if (!BOT_TOKEN) {
   console.error("❌ Missing TELEGRAM_BOT_TOKEN (or BOT_TOKEN/TOKEN)");
   process.exit(1);
 }
 
-const bot = new TelegramBot(token, { polling: true });
+const bot = new TelegramBot(BOT_TOKEN, { polling: true });
 const db = new sqlite3.Database("./gorktimus.db");
 
-// -------------------- State --------------------
-const pendingAdd = new Map(); // chatId -> true | "SET_USER_THRESHOLD" | "SET_USER_COOLDOWN" | "TOKEN_SET_THRESHOLD:<id>" | "TOKEN_SET_COOLDOWN:<id>"
-const pendingCandidate = new Map(); // chatId -> best pair object
+// ===================== ASSETS =====================
+const INTRO_IMG = path.join(__dirname, "assets", "gorktimus_intro_1280.png");
 
-// -------------------- DB --------------------
+// ===================== STATE =====================
+const pendingAdd = new Map(); // chatId -> true | "SET_USER_THRESHOLD" | "SET_USER_COOLDOWN" | "TOKEN_SET_THRESHOLD:<id>" | "TOKEN_SET_COOLDOWN:<id>"
+const pendingCandidate = new Map(); // chatId -> { chainId, pairAddress, symbol, url, priceUsd, liqUsd, vol24h }
+
+// ===================== DB =====================
 db.serialize(() => {
   db.run(`
     CREATE TABLE IF NOT EXISTS users (
@@ -40,6 +45,7 @@ db.serialize(() => {
       pair_address TEXT NOT NULL,
       symbol TEXT,
       url TEXT,
+
       last_price REAL,
       last_buys INTEGER,
       last_sells INTEGER,
@@ -54,7 +60,7 @@ db.serialize(() => {
     )
   `);
 
-  // Safe migrations (ignore errors if already exist)
+  // safe migrations (no-op if already exists)
   db.run(`ALTER TABLE users ADD COLUMN alerts_on INTEGER DEFAULT 1`, () => {});
   db.run(`ALTER TABLE users ADD COLUMN alert_threshold REAL DEFAULT 3.0`, () => {});
   db.run(`ALTER TABLE users ADD COLUMN alert_cooldown_sec INTEGER DEFAULT 120`, () => {});
@@ -64,7 +70,7 @@ db.serialize(() => {
   db.run(`ALTER TABLE watchlist ADD COLUMN token_cooldown_sec INTEGER`, () => {});
 });
 
-// -------------------- UI --------------------
+// ===================== UI HELPERS =====================
 function mainMenu() {
   return {
     inline_keyboard: [
@@ -81,21 +87,16 @@ function confirmKeyboard() {
     inline_keyboard: [
       [{ text: "✅ Add Watch", callback_data: "CONFIRM_ADD" }],
       [{ text: "❌ Cancel", callback_data: "CANCEL_ADD" }],
+      [{ text: "🏠 Home", callback_data: "HOME" }],
     ],
   };
 }
 
 function watchlistKeyboard(rows) {
-  // Show up to 10 tokens per page (simple MVP)
   const buttons = rows.slice(0, 10).map((r) => [
-    {
-      text: `${r.symbol || "???"}`,
-      callback_data: `TOKEN:${r.id}`,
-    },
+    { text: `${r.symbol || "???"}`, callback_data: `TOKEN:${r.id}` },
   ]);
-
   buttons.push([{ text: "🏠 Home", callback_data: "HOME" }]);
-
   return { inline_keyboard: buttons };
 }
 
@@ -129,7 +130,48 @@ function globalAlertsKeyboard(on, th, cd) {
   };
 }
 
-// -------------------- Helpers --------------------
+function ensureUser(chatId) {
+  db.run("INSERT OR IGNORE INTO users(chat_id) VALUES (?)", [chatId]);
+}
+
+// “Gorktimus appears above every menu”
+async function sendTerminal(chatId, caption, reply_markup) {
+  const payload = {};
+  if (reply_markup) payload.reply_markup = reply_markup;
+
+  try {
+    await bot.sendPhoto(chatId, INTRO_IMG, {
+      caption,
+      ...payload,
+    });
+  } catch (e) {
+    // fallback if photo path fails
+    await bot.sendMessage(chatId, caption, payload);
+  }
+}
+
+function fmtMoney(n) {
+  if (n === null || n === undefined) return "n/a";
+  const num = Number(n);
+  if (!Number.isFinite(num)) return "n/a";
+  if (num >= 1_000_000_000) return `$${(num / 1_000_000_000).toFixed(2)}B`;
+  if (num >= 1_000_000) return `$${(num / 1_000_000).toFixed(2)}M`;
+  if (num >= 1_000) return `$${Math.round(num).toLocaleString()}`;
+  return `$${num}`;
+}
+
+function pctChange(prev, curr) {
+  if (!prev || !curr || prev === 0) return 0;
+  return ((curr - prev) / prev) * 100;
+}
+
+function arrow(prev, curr) {
+  if (curr > prev) return "⬆️";
+  if (curr < prev) return "⬇️";
+  return "➡️";
+}
+
+// ===================== DEX HELPERS =====================
 function looksLikeSolAddress(s) {
   return /^[1-9A-HJ-NP-Za-km-z]{32,44}$/.test(s);
 }
@@ -173,101 +215,85 @@ function pickBestPair(pairs) {
   return scored[0] || null;
 }
 
-function fmtMoney(n) {
-  if (n === null || n === undefined) return "n/a";
-  const num = Number(n);
-  if (!Number.isFinite(num)) return "n/a";
-  if (num >= 1_000_000_000) return `$${(num / 1_000_000_000).toFixed(2)}B`;
-  if (num >= 1_000_000) return `$${(num / 1_000_000).toFixed(2)}M`;
-  if (num >= 1_000) return `$${Math.round(num).toLocaleString()}`;
-  return `$${num}`;
-}
-
-function pctChange(prev, curr) {
-  if (!prev || !curr || prev === 0) return 0;
-  return ((curr - prev) / prev) * 100;
-}
-
-function arrow(prev, curr) {
-  if (curr > prev) return "⬆️";
-  if (curr < prev) return "⬇️";
-  return "➡️";
-}
-
-// -------------------- Core: Add watch flow --------------------
+// ===================== WATCH FLOW =====================
 async function handleWatchQuery(chatId, input) {
   try {
     let q = input.trim();
+
+    // Dex link -> use pairAddress
     const dex = parseDexLink(q);
     if (dex) q = dex.pairAddress;
+
+    // support $TICKER and @TICKER
+    q = q.replace(/^\$/, "").replace(/^@/, "");
 
     const pairs = await dexscreenerSearch(q);
     const best = pickBestPair(pairs);
 
     if (!best) {
       pendingCandidate.delete(chatId);
-      await bot.sendMessage(chatId, "Couldn’t find that. Try ticker, coin address, or DexScreener link.");
+      await sendTerminal(chatId, "❌ Couldn’t find that.\nTry: ticker (BONK) • address • DexScreener link", mainMenu());
       return;
     }
 
     pendingCandidate.set(chatId, best);
 
     const msg =
-      `Found:\n\n` +
+      `🛡️ GORKTIMUS IDENTIFIED\n\n` +
       `🪙 ${best.symbol}\n` +
       `Price: ${best.priceUsd !== null ? `$${best.priceUsd}` : "n/a"}\n` +
       `Liquidity: ${fmtMoney(best.liqUsd)}\n` +
       `Vol 24h: ${fmtMoney(best.vol24h)}\n\n` +
       `${best.url || `${best.chainId}/${best.pairAddress}`}\n\n` +
-      `Tap ✅ Add Watch to save.`;
+      `Tap ✅ Add Watch.`;
 
-    await bot.sendMessage(chatId, msg, { reply_markup: confirmKeyboard() });
+    await sendTerminal(chatId, msg, confirmKeyboard());
   } catch (e) {
     pendingCandidate.delete(chatId);
-    await bot.sendMessage(chatId, "Lookup failed (DexScreener/API). Try again in a sec.");
+    await sendTerminal(chatId, "⚠️ Dex lookup failed. Try again in a sec.", mainMenu());
   }
 }
 
-function sendHome(chatId) {
-  bot.sendMessage(chatId, "🛡️ GORKTIMUS PRIME TERMINAL", { reply_markup: mainMenu() });
-}
-
-// -------------------- /start --------------------
-bot.onText(/\/start/, (msg) => {
+// ===================== START =====================
+bot.onText(/\/start/, async (msg) => {
   const chatId = msg.chat.id;
-  db.run("INSERT OR IGNORE INTO users(chat_id) VALUES (?)", [chatId]);
-  sendHome(chatId);
+  ensureUser(chatId);
+  await sendTerminal(chatId, "🛡️ GORKTIMUS PRIME TERMINAL\nSelect an option below.", mainMenu());
 });
 
-// -------------------- Buttons --------------------
+// ===================== BUTTONS =====================
 bot.on("callback_query", async (q) => {
   const chatId = q.message.chat.id;
   const action = q.data;
 
   bot.answerCallbackQuery(q.id).catch(() => null);
+  ensureUser(chatId);
 
-  if (action === "HOME") return sendHome(chatId);
+  if (action === "HOME") {
+    return sendTerminal(chatId, "🛡️ GORKTIMUS PRIME TERMINAL\nSelect an option below.", mainMenu());
+  }
 
   if (action === "WATCH") {
     pendingAdd.set(chatId, true);
     pendingCandidate.delete(chatId);
-    return bot.sendMessage(
+    return sendTerminal(
       chatId,
-      "Send **ticker** (BONK), **coin address**, or **DexScreener link**.\n\nI’ll identify it and you tap ✅ Add Watch.",
-      { parse_mode: "Markdown" }
+      "👁 ADD WATCH\nSend: ticker (BONK), coin address, or DexScreener link.\n\nThen tap ✅ Add Watch.",
+      mainMenu()
     );
   }
 
   if (action === "CANCEL_ADD") {
     pendingAdd.delete(chatId);
     pendingCandidate.delete(chatId);
-    return bot.sendMessage(chatId, "Cancelled.");
+    return sendTerminal(chatId, "Cancelled ✅", mainMenu());
   }
 
   if (action === "CONFIRM_ADD") {
     const cand = pendingCandidate.get(chatId);
-    if (!cand) return bot.sendMessage(chatId, "Nothing to add. Tap 👁 Add Watch first.");
+    if (!cand) return sendTerminal(chatId, "Nothing to add. Tap 👁 Add Watch first.", mainMenu());
 
+    // Prime txns once
     let pair = null;
     try { pair = await fetchPair(cand.chainId, cand.pairAddress); } catch {}
     const buys = pair?.txns?.m5?.buys ?? null;
@@ -278,10 +304,10 @@ bot.on("callback_query", async (q) => {
        VALUES(?,?,?,?,?,?,?,?)`,
       [chatId, cand.chainId, cand.pairAddress, cand.symbol, cand.url, cand.priceUsd, buys, sells],
       async (err) => {
-        if (err) return bot.sendMessage(chatId, "DB error adding watch.");
+        if (err) return sendTerminal(chatId, "DB error adding watch.", mainMenu());
         pendingAdd.delete(chatId);
         pendingCandidate.delete(chatId);
-        return bot.sendMessage(chatId, `✅ Watching: ${cand.symbol}\n${cand.url || `${cand.chainId}/${cand.pairAddress}`}`);
+        await sendTerminal(chatId, `✅ WATCHING: ${cand.symbol}\n${cand.url || `${cand.chainId}/${cand.pairAddress}`}`, mainMenu());
       }
     );
     return;
@@ -294,10 +320,10 @@ bot.on("callback_query", async (q) => {
        WHERE chat_id = ?
        ORDER BY id DESC`,
       [chatId],
-      (err, rows) => {
-        if (err) return bot.sendMessage(chatId, "DB error reading watchlist.");
-        if (!rows || rows.length === 0) return bot.sendMessage(chatId, "Watchlist empty.");
-        bot.sendMessage(chatId, "📋 Tap a token to manage:", { reply_markup: watchlistKeyboard(rows) });
+      async (err, rows) => {
+        if (err) return sendTerminal(chatId, "DB error reading watchlist.", mainMenu());
+        if (!rows || rows.length === 0) return sendTerminal(chatId, "Watchlist empty.", mainMenu());
+        await sendTerminal(chatId, "📋 WATCHLIST\nTap a token to manage:", watchlistKeyboard(rows));
       }
     );
     return;
@@ -310,8 +336,9 @@ bot.on("callback_query", async (q) => {
        FROM watchlist
        WHERE id = ? AND chat_id = ?`,
       [id, chatId],
-      (err, row) => {
-        if (!row) return bot.sendMessage(chatId, "Token not found.");
+      async (err, row) => {
+        if (!row) return sendTerminal(chatId, "Token not found.", mainMenu());
+
         const on = (row.token_alerts_on ?? 1) === 1;
         const th = row.token_threshold ?? null;
         const cd = row.token_cooldown_sec ?? null;
@@ -323,7 +350,7 @@ bot.on("callback_query", async (q) => {
           `Threshold: ${th ?? "GLOBAL"}%\n` +
           `Cooldown: ${cd ?? "GLOBAL"}s`;
 
-        bot.sendMessage(chatId, text, { reply_markup: tokenKeyboard(id, on, th, cd) });
+        await sendTerminal(chatId, text, tokenKeyboard(id, on, th, cd));
       }
     );
     return;
@@ -331,11 +358,11 @@ bot.on("callback_query", async (q) => {
 
   if (action.startsWith("TOKEN_TOGGLE:")) {
     const id = Number(action.split(":")[1]);
-    db.get(`SELECT token_alerts_on FROM watchlist WHERE id = ? AND chat_id = ?`, [id, chatId], (e, row) => {
+    db.get(`SELECT token_alerts_on FROM watchlist WHERE id = ? AND chat_id = ?`, [id, chatId], async (e, row) => {
       const cur = row?.token_alerts_on ?? 1;
       const next = cur ? 0 : 1;
-      db.run(`UPDATE watchlist SET token_alerts_on = ? WHERE id = ? AND chat_id = ?`, [next, id, chatId], () => {
-        bot.sendMessage(chatId, next ? "🔔 Token alerts ON" : "🔕 Token alerts OFF");
+      db.run(`UPDATE watchlist SET token_alerts_on = ? WHERE id = ? AND chat_id = ?`, [next, id, chatId], async () => {
+        await sendTerminal(chatId, next ? "🔔 Token alerts ON" : "🔕 Token alerts OFF", mainMenu());
       });
     });
     return;
@@ -343,8 +370,8 @@ bot.on("callback_query", async (q) => {
 
   if (action.startsWith("TOKEN_REMOVE:")) {
     const id = Number(action.split(":")[1]);
-    db.run(`DELETE FROM watchlist WHERE id = ? AND chat_id = ?`, [id, chatId], () => {
-      bot.sendMessage(chatId, "🗑 Removed from watchlist.");
+    db.run(`DELETE FROM watchlist WHERE id = ? AND chat_id = ?`, [id, chatId], async () => {
+      await sendTerminal(chatId, "🗑 Removed from watchlist.", mainMenu());
     });
     return;
   }
@@ -352,31 +379,31 @@ bot.on("callback_query", async (q) => {
   if (action.startsWith("TOKEN_SET_TH:")) {
     const id = Number(action.split(":")[1]);
     pendingAdd.set(chatId, `TOKEN_SET_THRESHOLD:${id}`);
-    return bot.sendMessage(chatId, "Reply with token threshold % (example: 3). Send 0 to reset to GLOBAL.");
+    return sendTerminal(chatId, "Reply with token threshold % (ex: 3). Send 0 to reset to GLOBAL.", mainMenu());
   }
 
   if (action.startsWith("TOKEN_SET_CD:")) {
     const id = Number(action.split(":")[1]);
     pendingAdd.set(chatId, `TOKEN_SET_COOLDOWN:${id}`);
-    return bot.sendMessage(chatId, "Reply with token cooldown seconds (example: 120). Send 0 to reset to GLOBAL.");
+    return sendTerminal(chatId, "Reply with token cooldown seconds (ex: 120). Send 0 to reset to GLOBAL.", mainMenu());
   }
 
   if (action === "ALERTS_MENU") {
-    db.get(`SELECT alerts_on, alert_threshold, alert_cooldown_sec FROM users WHERE chat_id = ?`, [chatId], (e, row) => {
+    db.get(`SELECT alerts_on, alert_threshold, alert_cooldown_sec FROM users WHERE chat_id = ?`, [chatId], async (e, row) => {
       const on = (row?.alerts_on ?? 1) === 1;
       const th = row?.alert_threshold ?? 3.0;
       const cd = row?.alert_cooldown_sec ?? 120;
-      bot.sendMessage(chatId, "🚨 Global Alert Settings:", { reply_markup: globalAlertsKeyboard(on, th, cd) });
+      await sendTerminal(chatId, "🚨 GLOBAL ALERT SETTINGS", globalAlertsKeyboard(on, th, cd));
     });
     return;
   }
 
   if (action === "ALERTS_TOGGLE") {
-    db.get(`SELECT alerts_on FROM users WHERE chat_id = ?`, [chatId], (e, row) => {
+    db.get(`SELECT alerts_on FROM users WHERE chat_id = ?`, [chatId], async (e, row) => {
       const cur = row?.alerts_on ?? 1;
       const next = cur ? 0 : 1;
-      db.run(`UPDATE users SET alerts_on = ? WHERE chat_id = ?`, [next, chatId], () => {
-        bot.sendMessage(chatId, next ? "🚨 Global alerts ON" : "🚨 Global alerts OFF");
+      db.run(`UPDATE users SET alerts_on = ? WHERE chat_id = ?`, [next, chatId], async () => {
+        await sendTerminal(chatId, next ? "🚨 Global alerts ON" : "🚨 Global alerts OFF", mainMenu());
       });
     });
     return;
@@ -384,35 +411,41 @@ bot.on("callback_query", async (q) => {
 
   if (action === "ALERTS_SET_THRESHOLD") {
     pendingAdd.set(chatId, "SET_USER_THRESHOLD");
-    return bot.sendMessage(chatId, "Reply with global threshold % (example: 3 or 5).");
+    return sendTerminal(chatId, "Reply with global threshold % (ex: 3 or 5).", mainMenu());
   }
 
   if (action === "ALERTS_SET_COOLDOWN") {
     pendingAdd.set(chatId, "SET_USER_COOLDOWN");
-    return bot.sendMessage(chatId, "Reply with global cooldown seconds (example: 120).");
+    return sendTerminal(chatId, "Reply with global cooldown seconds (ex: 120).", mainMenu());
   }
 
   if (action === "STATUS") {
-    return bot.sendMessage(chatId, "🟢 Online\n✅ Easy identify\n✅ Watchlist manager\n✅ Per-token settings");
+    return sendTerminal(
+      chatId,
+      "🟢 STATUS\n✅ Online\n✅ Image menus\n✅ Easy identify\n✅ Watch alerts\n✅ Per-token controls",
+      mainMenu()
+    );
   }
 });
 
-// -------------------- Messages --------------------
+// ===================== MESSAGES =====================
 bot.on("message", async (msg) => {
   const chatId = msg.chat.id;
   const text = (msg.text || "").trim();
   if (!text) return;
   if (text.startsWith("/")) return;
 
+  ensureUser(chatId);
+
   const mode = pendingAdd.get(chatId);
 
-  // Global settings
+  // Global settings replies
   if (mode === "SET_USER_THRESHOLD") {
     pendingAdd.delete(chatId);
     const v = Number(text);
-    if (!Number.isFinite(v) || v <= 0 || v > 100) return bot.sendMessage(chatId, "Bad value. Use a number like 3 or 5.");
-    db.run(`UPDATE users SET alert_threshold = ? WHERE chat_id = ?`, [v, chatId], () => {
-      bot.sendMessage(chatId, `🎯 Global threshold set to ${v}%`);
+    if (!Number.isFinite(v) || v <= 0 || v > 100) return sendTerminal(chatId, "Bad value. Use a number like 3 or 5.", mainMenu());
+    db.run(`UPDATE users SET alert_threshold = ? WHERE chat_id = ?`, [v, chatId], async () => {
+      await sendTerminal(chatId, `🎯 Global threshold set to ${v}%`, mainMenu());
     });
     return;
   }
@@ -420,21 +453,21 @@ bot.on("message", async (msg) => {
   if (mode === "SET_USER_COOLDOWN") {
     pendingAdd.delete(chatId);
     const v = Number(text);
-    if (!Number.isFinite(v) || v < 15 || v > 3600) return bot.sendMessage(chatId, "Bad value. Use seconds 15–3600.");
-    db.run(`UPDATE users SET alert_cooldown_sec = ? WHERE chat_id = ?`, [Math.round(v), chatId], () => {
-      bot.sendMessage(chatId, `⏱ Global cooldown set to ${Math.round(v)}s`);
+    if (!Number.isFinite(v) || v < 15 || v > 3600) return sendTerminal(chatId, "Bad value. Use seconds 15–3600.", mainMenu());
+    db.run(`UPDATE users SET alert_cooldown_sec = ? WHERE chat_id = ?`, [Math.round(v), chatId], async () => {
+      await sendTerminal(chatId, `⏱ Global cooldown set to ${Math.round(v)}s`, mainMenu());
     });
     return;
   }
 
-  // Token settings
+  // Token settings replies
   if (typeof mode === "string" && mode.startsWith("TOKEN_SET_THRESHOLD:")) {
     pendingAdd.delete(chatId);
     const id = Number(mode.split(":")[1]);
     const v = Number(text);
-    if (!Number.isFinite(v) || v < 0 || v > 100) return bot.sendMessage(chatId, "Bad value. Use 0–100.");
-    db.run(`UPDATE watchlist SET token_threshold = ? WHERE id = ? AND chat_id = ?`, [v === 0 ? null : v, id, chatId], () => {
-      bot.sendMessage(chatId, v === 0 ? "🎯 Token threshold reset to GLOBAL" : `🎯 Token threshold set to ${v}%`);
+    if (!Number.isFinite(v) || v < 0 || v > 100) return sendTerminal(chatId, "Bad value. Use 0–100.", mainMenu());
+    db.run(`UPDATE watchlist SET token_threshold = ? WHERE id = ? AND chat_id = ?`, [v === 0 ? null : v, id, chatId], async () => {
+      await sendTerminal(chatId, v === 0 ? "🎯 Token threshold reset to GLOBAL" : `🎯 Token threshold set to ${v}%`, mainMenu());
     });
     return;
   }
@@ -443,18 +476,20 @@ bot.on("message", async (msg) => {
     pendingAdd.delete(chatId);
     const id = Number(mode.split(":")[1]);
     const v = Number(text);
-    if (!Number.isFinite(v) || v < 0 || v > 3600) return bot.sendMessage(chatId, "Bad value. Use 0–3600.");
-    db.run(`UPDATE watchlist SET token_cooldown_sec = ? WHERE id = ? AND chat_id = ?`, [v === 0 ? null : Math.round(v), id, chatId], () => {
-      bot.sendMessage(chatId, v === 0 ? "⏱ Token cooldown reset to GLOBAL" : `⏱ Token cooldown set to ${Math.round(v)}s`);
+    if (!Number.isFinite(v) || v < 0 || v > 3600) return sendTerminal(chatId, "Bad value. Use 0–3600.", mainMenu());
+    db.run(`UPDATE watchlist SET token_cooldown_sec = ? WHERE id = ? AND chat_id = ?`, [v === 0 ? null : Math.round(v), id, chatId], async () => {
+      await sendTerminal(chatId, v === 0 ? "⏱ Token cooldown reset to GLOBAL" : `⏱ Token cooldown set to ${Math.round(v)}s`, mainMenu());
     });
     return;
   }
 
-  // Add watch inputs (only if user tapped Add Watch OR it's obviously an address/link)
+  // Add watch input handling
   const shouldHandle =
     pendingAdd.get(chatId) === true ||
     text.includes("dexscreener.com") ||
-    looksLikeSolAddress(text);
+    looksLikeSolAddress(text) ||
+    text.startsWith("$") ||
+    text.startsWith("@");
 
   if (!shouldHandle) return;
 
@@ -463,7 +498,7 @@ bot.on("message", async (msg) => {
   await handleWatchQuery(chatId, text);
 });
 
-// -------------------- WATCH ALERT ENGINE --------------------
+// ===================== ALERT ENGINE =====================
 async function runWatchAlertsTick() {
   const users = await new Promise((resolve) => {
     db.all(
@@ -480,7 +515,6 @@ async function runWatchAlertsTick() {
   for (const u of users) {
     const chatId = u.chat_id;
 
-    // pull watchlist
     const tokens = await new Promise((resolve) => {
       db.all(
         `SELECT id, chain_id, pair_address, symbol, url, last_price, last_buys, last_sells, last_alert_ts,
@@ -538,11 +572,10 @@ async function runWatchAlertsTick() {
         ].filter(Boolean).join("\n");
 
         bot.sendMessage(chatId, out).catch(() => null);
-
         db.run(`UPDATE watchlist SET last_alert_ts = ? WHERE id = ?`, [now, w.id]);
       }
 
-      // silent update
+      // silent refresh
       db.run(
         `UPDATE watchlist
          SET last_price = ?, last_buys = COALESCE(?, last_buys), last_sells = COALESCE(?, last_sells),
@@ -561,14 +594,14 @@ async function runWatchAlertsTick() {
   }
 }
 
-// every 60 sec
+// run every 60 seconds
 setInterval(() => {
   runWatchAlertsTick().catch(() => null);
 }, 60 * 1000);
 
-// -------------------- Errors --------------------
+// ===================== ERRORS =====================
 bot.on("polling_error", (err) => {
   console.error("❌ polling_error:", err?.message || err);
 });
 
-console.log("🛡️ Gorktimus bot running (V4 manager + per-token alerts)");
+console.log("🛡️ Gorktimus bot running (image menus + per-token controls)");
