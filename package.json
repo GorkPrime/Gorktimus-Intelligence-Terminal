@@ -1,4 +1,3 @@
-npm i axios
   "name": "gorktimus-prime-bot",
   "version": "1.0.0",
   "description": "Gorktimus Prime Telegram Intelligence Terminal",
@@ -11,3 +10,4 @@ npm i axios
     "sqlite3": "^5.1.6"
   }
 }
+npm i axios
