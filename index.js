@@ -11,27 +11,24 @@ if (!BOT_TOKEN) {
   process.exit(1);
 }
 
-const bot = new TelegramBot(BOT_TOKEN, {
-  polling: {
-    autoStart: true,
-    interval: 1000,
-    params: { timeout: 10 }
-  }
-});
-
 const INTRO_IMG = path.join(__dirname, "assets", "gorktimus_intro_1280.png");
 const DB_PATH = "./gorktimus.db";
 
 const SCAN_INTERVAL_MS = 15000;
-const DEFAULT_ALERT_PCT = 3;
-const DEFAULT_LIQ_ALERT_PCT = 10;
-const DEFAULT_TXN_DELTA = 5;
-const DEFAULT_COOLDOWN_SEC = 120;
+const DEFAULT_ALERT_PCT = 1;
+const DEFAULT_LIQ_ALERT_PCT = 5;
+const DEFAULT_TXN_DELTA = 2;
+const DEFAULT_COOLDOWN_SEC = 60;
 
 const db = new sqlite3.Database(DB_PATH);
 const pendingAction = new Map();
-let scanRunning = false;
 
+let bot = null;
+let scanInterval = null;
+let scanRunning = false;
+let shuttingDown = false;
+
+// ================= DB HELPERS =================
 function run(sql, params = []) {
   return new Promise((resolve, reject) => {
     db.run(sql, params, function (err) {
@@ -72,10 +69,10 @@ async function initDb() {
       base_address TEXT,
       dex_id TEXT,
       pair_url TEXT,
-      alert_pct REAL DEFAULT 3,
-      liq_alert_pct REAL DEFAULT 10,
-      txn_delta INTEGER DEFAULT 5,
-      cooldown_sec INTEGER DEFAULT 120,
+      alert_pct REAL DEFAULT 1,
+      liq_alert_pct REAL DEFAULT 5,
+      txn_delta INTEGER DEFAULT 2,
+      cooldown_sec INTEGER DEFAULT 60,
       active INTEGER DEFAULT 1,
       last_price REAL,
       last_liquidity REAL,
@@ -97,6 +94,7 @@ async function initDb() {
   `);
 }
 
+// ================= HELPERS =================
 function nowTs() {
   return Math.floor(Date.now() / 1000);
 }
@@ -204,6 +202,7 @@ async function sendTerminal(chatId, caption, keyboard) {
   }
 }
 
+// ================= DEX =================
 async function resolveWatchTarget(query) {
   const q = String(query || "").trim();
   if (!q) return null;
@@ -288,9 +287,6 @@ async function fetchPair(chainId, pairAddress) {
       volumeH24: num(pair.volume?.h24),
       buysM5: num(pair.txns?.m5?.buys),
       sellsM5: num(pair.txns?.m5?.sells),
-      priceChangeM5: num(pair.priceChange?.m5),
-      marketCap: num(pair.marketCap),
-      fdv: num(pair.fdv),
       url: String(pair.url || "")
     };
   } catch (err) {
@@ -311,6 +307,7 @@ async function fetchTopBoosted() {
   }
 }
 
+// ================= WATCHES =================
 async function addWatch(chatId, query) {
   const resolved = await resolveWatchTarget(query);
 
@@ -476,21 +473,19 @@ async function maybeAlert(row, fresh, manualMode = false) {
   const cooldownSec = num(row.cooldown_sec, DEFAULT_COOLDOWN_SEC);
   const cooldownOk = currentTs - num(row.last_alert_at, 0) >= cooldownSec;
 
-  if (reasons.length && (cooldownOk || manualMode)) {
-    if (!manualMode) {
-      await bot.sendMessage(
-        row.chat_id,
-        `🚨 ${fresh.baseSymbol || row.base_symbol || row.query}
+  if (reasons.length && cooldownOk && !manualMode) {
+    await bot.sendMessage(
+      row.chat_id,
+      `🚨 ${fresh.baseSymbol || row.base_symbol || row.query}
 ${reasons.join("\n")}
 
 Price: ${shortUsd(fresh.priceUsd)}
 Liquidity: ${shortUsd(fresh.liquidityUsd)}
 24h Volume: ${shortUsd(fresh.volumeH24)}
 M5: B ${fresh.buysM5} | S ${fresh.sellsM5}`
-      );
+    );
 
-      await run(`UPDATE watches SET last_alert_at = ? WHERE id = ?`, [currentTs, row.id]);
-    }
+    await run(`UPDATE watches SET last_alert_at = ? WHERE id = ?`, [currentTs, row.id]);
   }
 
   await run(
@@ -513,17 +508,12 @@ M5: B ${fresh.buysM5} | S ${fresh.sellsM5}`
     liquidity: fresh.liquidityUsd,
     buysM5: fresh.buysM5,
     sellsM5: fresh.sellsM5,
-    pMove,
-    lMove,
-    buyDelta,
-    sellDelta,
     triggered: reasons
   };
 }
 
 async function scanWatches(manualMode = false, targetChatId = null) {
   if (scanRunning && !manualMode) return { scanned: 0, results: [] };
-
   scanRunning = true;
 
   try {
@@ -543,16 +533,10 @@ async function scanWatches(manualMode = false, targetChatId = null) {
       results.push(result);
     }
 
-    return {
-      scanned: rows.length,
-      results
-    };
+    return { scanned: rows.length, results };
   } catch (err) {
     console.log("scanWatches error:", err.message);
-    return {
-      scanned: 0,
-      results: []
-    };
+    return { scanned: 0, results: [] };
   } finally {
     scanRunning = false;
   }
@@ -594,94 +578,148 @@ ${lines.join("\n\n")}`
   );
 }
 
-bot.onText(/\/start/, async (msg) => {
-  const chatId = msg.chat.id;
-  await ensureUserSettings(chatId);
+// ================= BOT HANDLERS =================
+async function registerHandlers() {
+  bot.onText(/\/start/, async (msg) => {
+    const chatId = msg.chat.id;
+    await ensureUserSettings(chatId);
+    await sendTerminal(chatId, "🛡️ GORKTIMUS PRIME TERMINAL\nSelect an option below.", mainMenu());
+  });
 
-  await sendTerminal(
-    chatId,
-    "🛡️ GORKTIMUS PRIME TERMINAL\nSelect an option below.",
-    mainMenu()
-  );
-});
+  bot.onText(/\/scan/, async (msg) => {
+    await forceScan(msg.chat.id);
+  });
 
-bot.onText(/\/scan/, async (msg) => {
-  await forceScan(msg.chat.id);
-});
+  bot.on("callback_query", async (query) => {
+    const chatId = query.message.chat.id;
+    const data = query.data || "";
 
-bot.on("callback_query", async (query) => {
-  const chatId = query.message.chat.id;
-  const data = query.data || "";
+    try {
+      if (data === "add_watch") {
+        pendingAction.set(chatId, { type: "ADD_WATCH" });
+        await bot.sendMessage(chatId, "Send ticker, token address, or pair search. Example: SOL");
+      } else if (data === "watchlist") {
+        await showWatchlist(chatId);
+      } else if (data === "global_alerts") {
+        await toggleGlobalAlerts(chatId);
+      } else if (data === "status") {
+        await showStatus(chatId);
+      } else if (data === "scan_now") {
+        await forceScan(chatId);
+      } else if (data === "refresh_menu") {
+        await sendTerminal(chatId, "🛡️ GORKTIMUS PRIME TERMINAL\nRefreshed.", mainMenu());
+      } else if (data === "main_menu") {
+        await sendTerminal(chatId, "🛡️ GORKTIMUS PRIME TERMINAL\nSelect an option below.", mainMenu());
+      } else if (data.startsWith("remove_watch:")) {
+        const id = Number(data.split(":")[1]);
+        if (Number.isFinite(id)) {
+          await removeWatch(chatId, id);
+        }
+      }
+
+      await bot.answerCallbackQuery(query.id);
+    } catch (err) {
+      console.log("callback error:", err.message);
+      try {
+        await bot.answerCallbackQuery(query.id, { text: "Something glitched." });
+      } catch (_) {}
+    }
+  });
+
+  bot.on("message", async (msg) => {
+    const chatId = msg.chat.id;
+    const text = msg.text;
+
+    if (!text) return;
+    if (text.startsWith("/start") || text.startsWith("/scan")) return;
+
+    const pending = pendingAction.get(chatId);
+    if (!pending) return;
+
+    try {
+      if (pending.type === "ADD_WATCH") {
+        pendingAction.delete(chatId);
+        await addWatch(chatId, text.trim());
+      }
+    } catch (err) {
+      pendingAction.delete(chatId);
+      console.log("message handler error:", err.message);
+      await bot.sendMessage(chatId, "❌ Could not process that request.");
+    }
+  });
+
+  bot.on("polling_error", (err) => {
+    console.log("Polling error:", err.code, err.message);
+  });
+
+  bot.on("error", (err) => {
+    console.log("Bot error:", err.message);
+  });
+}
+
+// ================= CLEAN SHUTDOWN =================
+async function shutdown(signal) {
+  if (shuttingDown) return;
+  shuttingDown = true;
+
+  console.log(`🛑 Shutdown signal received: ${signal}`);
 
   try {
-    if (data === "add_watch") {
-      pendingAction.set(chatId, { type: "ADD_WATCH" });
-      await bot.sendMessage(chatId, "Send ticker, token address, or pair search. Example: SOL");
-    } else if (data === "watchlist") {
-      await showWatchlist(chatId);
-    } else if (data === "global_alerts") {
-      await toggleGlobalAlerts(chatId);
-    } else if (data === "status") {
-      await showStatus(chatId);
-    } else if (data === "scan_now") {
-      await forceScan(chatId);
-    } else if (data === "refresh_menu") {
-      await sendTerminal(chatId, "🛡️ GORKTIMUS PRIME TERMINAL\nRefreshed.", mainMenu());
-    } else if (data === "main_menu") {
-      await sendTerminal(chatId, "🛡️ GORKTIMUS PRIME TERMINAL\nSelect an option below.", mainMenu());
-    } else if (data.startsWith("remove_watch:")) {
-      const id = Number(data.split(":")[1]);
-      if (Number.isFinite(id)) {
-        await removeWatch(chatId, id);
+    if (scanInterval) {
+      clearInterval(scanInterval);
+      scanInterval = null;
+    }
+
+    if (bot) {
+      try {
+        await bot.stopPolling();
+        console.log("✅ Polling stopped cleanly");
+      } catch (err) {
+        console.log("stopPolling error:", err.message);
       }
     }
 
-    await bot.answerCallbackQuery(query.id);
+    db.close(() => {
+      console.log("✅ DB closed");
+      process.exit(0);
+    });
+
+    setTimeout(() => process.exit(0), 3000);
   } catch (err) {
-    console.log("callback error:", err.message);
-    try {
-      await bot.answerCallbackQuery(query.id, { text: "Something glitched." });
-    } catch (_) {}
+    console.log("shutdown error:", err.message);
+    process.exit(0);
   }
-});
+}
 
-bot.on("message", async (msg) => {
-  const chatId = msg.chat.id;
-  const text = msg.text;
+process.once("SIGTERM", () => shutdown("SIGTERM"));
+process.once("SIGINT", () => shutdown("SIGINT"));
 
-  if (!text) return;
-  if (text.startsWith("/start") || text.startsWith("/scan")) return;
-
-  const pending = pendingAction.get(chatId);
-  if (!pending) return;
-
-  try {
-    if (pending.type === "ADD_WATCH") {
-      pendingAction.delete(chatId);
-      await addWatch(chatId, text.trim());
-    }
-  } catch (err) {
-    pendingAction.delete(chatId);
-    console.log("message handler error:", err.message);
-    await bot.sendMessage(chatId, "❌ Could not process that request.");
-  }
-});
-
-bot.on("polling_error", (err) => {
-  console.log("Polling error:", err.code, err.message);
-});
-
-bot.on("error", (err) => {
-  console.log("Bot error:", err.message);
-});
-
+// ================= BOOT =================
 (async () => {
   await initDb();
-  await ensureUserSettings("system_bootstrap").catch(() => {});
+
+  bot = new TelegramBot(BOT_TOKEN, {
+    polling: {
+      autoStart: false,
+      interval: 1000,
+      params: { timeout: 10 }
+    }
+  });
+
+  try {
+    await bot.deleteWebHook({ drop_pending_updates: false });
+    console.log("✅ Webhook cleared");
+  } catch (err) {
+    console.log("deleteWebHook warning:", err.message);
+  }
+
+  await registerHandlers();
+  await bot.startPolling();
+
   console.log("🧠 Gorktimus Prime Bot Running...");
   console.log("📁 Image exists on boot:", fs.existsSync(INTRO_IMG));
 
-  setInterval(() => {
+  scanInterval = setInterval(() => {
     scanWatches(false, null);
   }, SCAN_INTERVAL_MS);
 })();
