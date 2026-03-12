@@ -2,7 +2,7 @@
 
 /**
  * Gorktimus Prime Intelligence Terminal
- * Full index.js upgrade
+ * Full bug-fixed index.js
  *
  * Required packages:
  * npm i node-telegram-bot-api axios sqlite3
@@ -22,7 +22,6 @@
  */
 
 const fs = require("fs");
-const path = require("path");
 const axios = require("axios");
 const sqlite3 = require("sqlite3").verbose();
 const TelegramBot = require("node-telegram-bot-api");
@@ -52,7 +51,6 @@ if (!BOT_TOKEN) {
 // ==============================
 const bot = new TelegramBot(BOT_TOKEN, { polling: true });
 
-// clear webhook in case Railway/previous deploy left one
 (async () => {
   try {
     await bot.deleteWebHook();
@@ -115,8 +113,8 @@ async function initDb() {
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       chat_id INTEGER NOT NULL,
       chain_id TEXT NOT NULL,
-      token_address TEXT,
-      pair_address TEXT,
+      token_address TEXT NOT NULL DEFAULT '',
+      pair_address TEXT NOT NULL DEFAULT '',
       symbol TEXT,
       token_name TEXT,
       last_price_usd REAL,
@@ -126,7 +124,7 @@ async function initDb() {
       last_sells INTEGER,
       last_alert_at INTEGER DEFAULT 0,
       created_at INTEGER,
-      UNIQUE(chat_id, chain_id, COALESCE(token_address,''), COALESCE(pair_address,''))
+      UNIQUE(chat_id, chain_id, token_address, pair_address)
     )
   `);
 
@@ -555,7 +553,15 @@ async function addToWatchlist(chatId, chainId, tokenAddress, pairAddress, symbol
     INSERT OR IGNORE INTO watchlist (
       chat_id, chain_id, token_address, pair_address, symbol, token_name, created_at
     ) VALUES (?, ?, ?, ?, ?, ?, ?)
-  `, [chatId, chainId, tokenAddress || "", pairAddress || "", symbol || "", tokenName || "", now()]);
+  `, [
+    chatId,
+    chainId || CHAIN_DEFAULT,
+    tokenAddress || "",
+    pairAddress || "",
+    symbol || "",
+    tokenName || "",
+    now()
+  ]);
 }
 
 async function removeFromWatchlist(chatId, tokenOrPair) {
@@ -699,8 +705,8 @@ async function renderTrending(chatId) {
     const lines = [`📈 <b>TRENDING / BOOSTED</b>`, ``];
     const kb = [];
 
-    for (let i = 0; i < solBoosts.length; i++) {
-      const item = solBoosts[i];
+    let count = 0;
+    for (const item of solBoosts) {
       const pairs = await dsTokenPairs(item.chainId, item.tokenAddress).catch(() => []);
       const pair = bestPairFromPairs(pairs, item.chainId);
       if (!pair) continue;
@@ -709,13 +715,20 @@ async function renderTrending(chatId) {
       const liq = Number(pair?.liquidity?.usd || 0);
       if (liq < TRENDING_MIN_LIQUIDITY) continue;
 
+      count += 1;
       lines.push(
-        `${i + 1}. <b>${escapeHtml(t.tokenName)}</b> (${escapeHtml(t.symbol)})`,
+        `${count}. <b>${escapeHtml(t.tokenName)}</b> (${escapeHtml(t.symbol)})`,
         `💰 MC ${usd(pair?.marketCap || pair?.fdv || 0)} | 💧 LQ ${usd(liq)} | 📊 5m ${pct(pair?.priceChange?.m5 || 0)}`,
         ``
       );
 
       kb.push([{ text: `${t.symbol} Snapshot`, callback_data: `inspect:${t.chainId}:${t.tokenAddress}` }]);
+    }
+
+    if (!count) {
+      return sendSimple(chatId, `📈 <b>No trending tokens passed your liquidity floor right now.</b>`, {
+        inline_keyboard: [[{ text: "⬅️ Back", callback_data: "menu:home" }]]
+      });
     }
 
     kb.push([{ text: "⬅️ Back", callback_data: "menu:home" }]);
@@ -741,8 +754,8 @@ async function renderNewLaunches(chatId) {
     const lines = [`🆕 <b>NEW LAUNCH SURFACE</b>`, ``];
     const kb = [];
 
-    for (let i = 0; i < solProfiles.length; i++) {
-      const profile = solProfiles[i];
+    let count = 0;
+    for (const profile of solProfiles) {
       const pairs = await dsTokenPairs(profile.chainId, profile.tokenAddress).catch(() => []);
       const pair = bestPairFromPairs(pairs, profile.chainId);
       if (!pair) continue;
@@ -750,8 +763,9 @@ async function renderNewLaunches(chatId) {
       const ageMin = ageMinutesFromTs(pair?.pairCreatedAt);
       const t = getTokenDisplay(pair);
 
+      count += 1;
       lines.push(
-        `${i + 1}. <b>${escapeHtml(t.tokenName)}</b> (${escapeHtml(t.symbol)})`,
+        `${count}. <b>${escapeHtml(t.tokenName)}</b> (${escapeHtml(t.symbol)})`,
         `⏱️ ${ageMin !== null ? `${ageMin} min` : "Age unknown"} | 💧 ${usd(pair?.liquidity?.usd || 0)} | 💰 ${usd(pair?.marketCap || pair?.fdv || 0)}`,
         ``
       );
@@ -779,8 +793,8 @@ async function renderWhaleMenu(chatId) {
   const lines = [
     `🐋 <b>WHALE TRACKER</b>`,
     ``,
-    `This module is wired for premium UX now.`,
-    `You can store wallets today and plug in a wallet feed/provider next.`,
+    `Wallet storage and UI are ready.`,
+    `Live whale-activity provider can be plugged in next.`,
     ``
   ];
 
@@ -1365,8 +1379,7 @@ async function whaleTrackerHeartbeat() {
 
     if (!enabledCount?.count) return;
 
-    // Placeholder for future wallet feed/provider integration.
-    // UX is ready. Data source can be plugged in next.
+    // placeholder for future wallet feed integration
   } catch (err) {
     console.error("whaleTrackerHeartbeat error:", err.message);
   }
@@ -1383,7 +1396,6 @@ async function whaleTrackerHeartbeat() {
     console.log("🖼️ Menu image exists:", fs.existsSync(MENU_IMAGE_PATH));
     console.log("⏱️ Poll interval ms:", ALERT_POLL_MS);
 
-    // warm state
     const booted = await getState("booted_once");
     if (!booted) {
       await setState("booted_once", "1");
