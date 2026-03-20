@@ -1479,9 +1479,12 @@ function buildTrendingLine(pair, idx) {
 
 // ================= MARKET SCREENS =================
 async function showMainMenu(chatId) {
-const pulse = await getNetworkPulse();
+  const pulse = await getNetworkPulse();
 
-`🧠 <b>Gorktimus Intelligence Terminal</b>\n\n${pulse}\n\nLive intelligence...`
+  await sendMenu(
+    chatId,
+    `🧠 <b>Gorktimus Intelligence Terminal</b>\n\n${pulse}\n\nLive intelligence. On-demand execution.\nNo clutter. No spam.\n\nSelect an operation below.`,
+    buildMainMenu()
   );
 }
 
