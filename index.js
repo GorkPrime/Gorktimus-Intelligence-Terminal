@@ -87,7 +87,19 @@ function all(sql, params = []) {
   });
 }
 
-async function initDb() {
+async function initDb() {await run(`
+  CREATE TABLE IF NOT EXISTS user_activity (
+    user_id TEXT,
+    ts INTEGER
+  )
+`);
+
+await run(`
+  CREATE TABLE IF NOT EXISTS scan_logs (
+    user_id TEXT,
+    ts INTEGER
+  )
+`);
   await run(`
     CREATE TABLE IF NOT EXISTS wallet_tracks (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
