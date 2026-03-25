@@ -1051,7 +1051,7 @@ process.once("SIGINT", () => shutdown("SIGINT"));
         transparencyScore = 3;
       }
 
-      transparencyDetail = [
+    transparencyDetail = [
         `Source: ${hasSource ? "yes" : "no"}`,
         `ABI: ${hasAbi ? "yes" : "no"}`,
         `Proxy: ${proxy || implementation ? "yes" : "no"}`
@@ -1090,7 +1090,7 @@ process.once("SIGINT", () => shutdown("SIGINT"));
     rawScore += ageMin > 0 && ageMin < 120 ? 6 : 0;
     rawScore += num(pair.buysM5) > num(pair.sellsM5) ? 4 : 0;
     rawScore -= num(pair.liquidityUsd) < 15000 ? 2 : 0;
-  } else if (mode === "guardian") {
+  } if (mode === "guardian") {
     rawScore -= num(pair.liquidityUsd) < 25000 ? 6 : 0;
     rawScore -= holderTop5Pct >= 70 ? 8 : 0;
     rawScore -= isHoneypot === true ? 12 : 0;
