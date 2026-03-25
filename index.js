@@ -1043,9 +1043,9 @@ process.once("SIGINT", () => shutdown("SIGINT"));
       scanWatchlistAlerts().catch((err) => console.log("scanWatchlistAlerts loop error:", err.message));
     }, WATCHLIST_SCAN_INTERVAL_MS);
   }
-})();
+})() } else {;
+        
         transparencyScore = proxy ? 11 : 15;
-      } else {
         transparencyLabel = "Unverified";
         transparencyEmoji = "⚠️";
         transparencyScore = 3;
