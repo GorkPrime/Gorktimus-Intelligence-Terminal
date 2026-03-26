@@ -1,261 +1,157 @@
-
-/**
- * GorKtimus New Update
- * Fresh rebuild from scratch
- * Core stack: Telegram + DexScreener + SQLite + optional Helius
- *
- * Required env:
- * TELEGRAM_BOT_TOKEN=...
- * CHANNEL_USERNAME=@yourchannel            // optional membership gate
- * HELIUS_API_KEY=...                       // optional wallet tracking
- * OPENAI_API_KEY=...                       // optional future AI mode
- * DEFAULT_ALERT_PCT=5
- * DEFAULT_LIQ_ALERT_PCT=10
- * ALERT_COOLDOWN_SECONDS=900
- */
-
-"use strict";
-
-const path = require("path");
-const crypto = require("crypto");
-const axios = require("axios");
 const TelegramBot = require("node-telegram-bot-api");
+const axios = require("axios");
 const sqlite3 = require("sqlite3").verbose();
-const { promisify } = require("util");
+const path = require("path");
+const fs = require("fs");
 
-const BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN || "";
-const CHANNEL_USERNAME = process.env.CHANNEL_USERNAME || "";
+// ================= ENV =================
+const BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 const HELIUS_API_KEY = process.env.HELIUS_API_KEY || "";
-const OPENAI_API_KEY = process.env.OPENAI_API_KEY || "";
-const DEFAULT_ALERT_PCT = Number(process.env.DEFAULT_ALERT_PCT || 5);
-const DEFAULT_LIQ_ALERT_PCT = Number(process.env.DEFAULT_LIQ_ALERT_PCT || 10);
-const ALERT_COOLDOWN_SECONDS = Number(process.env.ALERT_COOLDOWN_SECONDS || 900);
-const DB_PATH = process.env.DB_PATH || path.join(__dirname, "gorktimus.db");
+const ETHERSCAN_API_KEY = process.env.ETHERSCAN_API_KEY || "";
+const COMMUNITY_X_URL =
+  process.env.COMMUNITY_X_URL || "https://x.com/gorktimusprime";
+const COMMUNITY_TELEGRAM_URL =
+  process.env.COMMUNITY_TELEGRAM_URL || "https://t.me/gorktimusprimezone";
+
+// IMPORTANT:
+// This must be the Telegram channel/group username like @gorktimusprimezone
+// OR a numeric chat id like -1001234567890
+// DO NOT put the invite link here.
+const REQUIRED_CHANNEL =
+  process.env.REQUIRED_CHANNEL || "@gorktimusprimezone";
 
 if (!BOT_TOKEN) {
-  console.error("TELEGRAM_BOT_TOKEN not provided");
+  console.error("❌ TELEGRAM_BOT_TOKEN not set");
   process.exit(1);
 }
 
-const bot = new TelegramBot(BOT_TOKEN, { polling: true });
-const db = new sqlite3.Database(DB_PATH);
+// ================= CONFIG =================
+const TERMINAL_IMG = path.join(__dirname, "assets", "gorktimus_terminal.png");
+const DB_PATH = path.join(__dirname, "gorktimus.db");
 
-const run = (sql, params = []) =>
-  new Promise((resolve, reject) => {
-    db.run(sql, params, function onRun(err) {
-      if (err) return reject(err);
-      resolve(this);
+const SUPPORTED_CHAINS = ["solana", "base", "ethereum"];
+const PRIME_MIN_LIQ_USD = 30000;
+const PRIME_MIN_VOL_USD = 20000;
+const PRIME_MIN_AGE_MIN = 30;
+
+const LAUNCH_MIN_LIQ_USD = 5000;
+const LAUNCH_MIN_VOL_USD = 1000;
+
+const WALLET_SCAN_INTERVAL_MS = 20000;
+const DEX_TIMEOUT_MS = 15000;
+const HELIUS_TIMEOUT_MS = 20000;
+const TELEGRAM_SEND_RETRY_MS = 900;
+const WATCHLIST_SCAN_INTERVAL_MS = 180000;
+const WATCHLIST_ALERT_COOLDOWN_SEC = 1800;
+const MAX_WATCHLIST_ITEMS = 30;
+
+const ETHERSCAN_V2_URL = "https://api.etherscan.io/v2/api";
+const HONEYPOT_API_BASE = "https://api.honeypot.is";
+
+const EVM_CHAIN_IDS = {
+  ethereum: 1,
+  base: 8453
+};
+
+// ================= GLOBALS =================
+const db = new sqlite3.Database(DB_PATH);
+const pendingAction = new Map();
+let bot = null;
+let walletScanInterval = null;
+let watchlistScanInterval = null;
+let walletScanRunning = false;
+let shuttingDown = false;
+let BOT_USERNAME = "";
+
+// ================= DB HELPERS =================
+function run(sql, params = []) {
+  return new Promise((resolve, reject) => {
+    db.run(sql, params, function (err) {
+      if (err) reject(err);
+      else resolve(this);
     });
   });
-
-const get = promisify(db.get.bind(db));
-const all = promisify(db.all.bind(db));
-
-function nowTs() {
-  return Date.now();
 }
 
-function sleep(ms) {
-  return new Promise((resolve) => setTimeout(resolve, ms));
-}
-
-function safeNum(value, fallback = 0) {
-  const n = Number(value);
-  return Number.isFinite(n) ? n : fallback;
-}
-
-function pctChange(oldValue, newValue) {
-  if (!Number.isFinite(oldValue) || oldValue === 0) return 0;
-  return ((newValue - oldValue) / oldValue) * 100;
-}
-
-function fmtInt(n) {
-  return Number.isFinite(n) ? Math.round(n).toLocaleString("en-US") : "0";
-}
-
-function fmtUsd(n) {
-  const value = safeNum(n, NaN);
-  if (!Number.isFinite(value)) return "N/A";
-  if (Math.abs(value) >= 1_000_000_000) return `$${(value / 1_000_000_000).toFixed(2)}B`;
-  if (Math.abs(value) >= 1_000_000) return `$${(value / 1_000_000).toFixed(2)}M`;
-  if (Math.abs(value) >= 1_000) return `$${(value / 1_000).toFixed(2)}K`;
-  if (Math.abs(value) >= 1) return `$${value.toFixed(2)}`;
-  if (value > 0) return `$${value.toFixed(6)}`;
-  return "$0.00";
-}
-
-function fmtPct(n) {
-  const value = safeNum(n, NaN);
-  return Number.isFinite(value) ? `${value.toFixed(2)}%` : "N/A";
-}
-
-function escapeHtml(input = "") {
-  return String(input)
-    .replace(/&/g, "&amp;")
-    .replace(/</g, "&lt;")
-    .replace(/>/g, "&gt;");
-}
-
-function shortAddr(addr = "", head = 6, tail = 4) {
-  if (!addr || addr.length <= head + tail + 3) return addr || "N/A";
-  return `${addr.slice(0, head)}...${addr.slice(-tail)}`;
-}
-
-function normalizeText(v = "") {
-  return String(v).trim();
-}
-
-function hasHelius() {
-  return Boolean(HELIUS_API_KEY);
-}
-
-function isLikelySolanaWallet(input = "") {
-  return /^[1-9A-HJ-NP-Za-km-z]{32,44}$/.test(String(input).trim());
-}
-
-function makeHash(input = "") {
-  return crypto.createHash("sha256").update(String(input)).digest("hex");
-}
-
-function buildMainMenu() {
-  return {
-    reply_markup: {
-      inline_keyboard: [
-        [
-          { text: "Scan Token", callback_data: "menu_scan" },
-          { text: "Trending", callback_data: "menu_trending" }
-        ],
-        [
-          { text: "Watchlist", callback_data: "menu_watchlist" },
-          { text: "Alerts", callback_data: "menu_alerts" }
-        ],
-        [
-          { text: "Wallet Tracking", callback_data: "menu_wallets" },
-          { text: "AI Assistant", callback_data: "menu_ai" }
-        ],
-        [
-          { text: "Modes / Settings", callback_data: "menu_settings" },
-          { text: "Help", callback_data: "menu_help" }
-        ],
-        [{ text: "Referrals", callback_data: "menu_referrals" }]
-      ]
-    },
-    parse_mode: "HTML",
-    disable_web_page_preview: true
-  };
-}
-
-function buildBackMenuRow() {
-  return [{ text: "Main Menu", callback_data: "main_menu" }];
-}
-
-function buildModeButtons(activeMode = "balanced") {
-  const decorate = (mode, label) => (mode === activeMode ? `* ${label}` : label);
-  return {
-    reply_markup: {
-      inline_keyboard: [
-        [{ text: decorate("fast", "Mode A - Fast Scan"), callback_data: "mode_fast" }],
-        [{ text: decorate("balanced", "Mode B - Balanced Intelligence"), callback_data: "mode_balanced" }],
-        [{ text: decorate("deep", "Mode C - Deep Defense"), callback_data: "mode_deep" }],
-        buildBackMenuRow()
-      ]
-    },
-    parse_mode: "HTML"
-  };
-}
-
-function buildAlertsMenu(settings) {
-  const onOff = (v) => (v ? "ON" : "OFF");
-  return {
-    reply_markup: {
-      inline_keyboard: [
-        [{ text: `Price Alerts ${onOff(settings.price_alerts)}`, callback_data: "toggle_alert_price" }],
-        [{ text: `Liquidity Alerts ${onOff(settings.liq_alerts)}`, callback_data: "toggle_alert_liq" }],
-        [{ text: `Watchlist Risk ${onOff(settings.risk_alerts)}`, callback_data: "toggle_alert_risk" }],
-        [{ text: `Wallet Alerts ${onOff(settings.wallet_alerts)}`, callback_data: "toggle_alert_wallet" }],
-        buildBackMenuRow()
-      ]
-    },
-    parse_mode: "HTML"
-  };
-}
-
-function buildWatchlistMenu(tokens) {
-  const keyboard = tokens.slice(0, 10).map((t) => [
-    { text: `Scan ${t.symbol || t.query || shortAddr(t.contract_address || "", 6, 4)}`, callback_data: `watch_scan:${t.id}` },
-    { text: "Remove", callback_data: `watch_remove:${t.id}` }
-  ]);
-  keyboard.push(buildBackMenuRow());
-  return {
-    reply_markup: { inline_keyboard: keyboard },
-    parse_mode: "HTML",
-    disable_web_page_preview: true
-  };
-}
-
-function buildTrendingMenu(items) {
-  const keyboard = items.slice(0, 10).map((item) => [
-    { text: `${item.baseToken?.symbol || "TOKEN"} | ${fmtUsd(item.liquidity?.usd)}`, callback_data: `trend_scan:${encodeURIComponent(item.pairAddress || item.baseToken?.address || "")}` }
-  ]);
-  keyboard.push(buildBackMenuRow());
-  return {
-    reply_markup: { inline_keyboard: keyboard },
-    parse_mode: "HTML",
-    disable_web_page_preview: true
-  };
-}
-
-async function sendText(chatId, text, extra = {}) {
-  return bot.sendMessage(chatId, text, {
-    parse_mode: "HTML",
-    disable_web_page_preview: true,
-    ...extra
+function get(sql, params = []) {
+  return new Promise((resolve, reject) => {
+    db.get(sql, params, function (err, row) {
+      if (err) reject(err);
+      else resolve(row);
+    });
   });
 }
 
-async function editText(chatId, messageId, text, extra = {}) {
-  return bot.editMessageText(text, {
-    chat_id: chatId,
-    message_id: messageId,
-    parse_mode: "HTML",
-    disable_web_page_preview: true,
-    ...extra
+function all(sql, params = []) {
+  return new Promise((resolve, reject) => {
+    db.all(sql, params, function (err, rows) {
+      if (err) reject(err);
+      else resolve(rows);
+    });
   });
 }
 
-async function answerCb(id, text = "") {
-  try {
-    await bot.answerCallbackQuery(id, text ? { text, show_alert: false } : {});
-  } catch (_) {
-    // ignore
-  }
-}
+async function initDb() {await run(`
+  CREATE TABLE IF NOT EXISTS user_activity (
+    user_id TEXT,
+    ts INTEGER
+  )
+`);
 
-async function initDb() {
+await run(`
+  CREATE TABLE IF NOT EXISTS scan_logs (
+    user_id TEXT,
+    ts INTEGER
+  )
+`);
+  await run(`
+    CREATE TABLE IF NOT EXISTS wallet_tracks (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      chat_id TEXT NOT NULL,
+      wallet TEXT NOT NULL,
+      label_type TEXT NOT NULL,
+      nickname TEXT,
+      chain_id TEXT DEFAULT 'solana',
+      active INTEGER DEFAULT 1,
+      alerts_enabled INTEGER DEFAULT 1,
+      last_signature TEXT,
+      last_seen_at INTEGER DEFAULT 0,
+      created_at INTEGER NOT NULL,
+      updated_at INTEGER NOT NULL,
+      UNIQUE(chat_id, wallet, label_type)
+    )
+  `);
+
+  await run(`
+    CREATE TABLE IF NOT EXISTS app_meta (
+      key TEXT PRIMARY KEY,
+      value TEXT
+    )
+  `);
+
   await run(`
     CREATE TABLE IF NOT EXISTS users (
-      chat_id TEXT PRIMARY KEY,
+      user_id TEXT PRIMARY KEY,
+      chat_id TEXT,
       username TEXT,
       first_name TEXT,
-      mode TEXT NOT NULL DEFAULT 'balanced',
-      expecting_input TEXT,
-      ai_enabled INTEGER NOT NULL DEFAULT 1,
-      member_verified INTEGER NOT NULL DEFAULT 0,
+      last_name TEXT,
+      is_subscribed INTEGER DEFAULT 0,
       created_at INTEGER NOT NULL,
       updated_at INTEGER NOT NULL
     )
   `);
 
   await run(`
-    CREATE TABLE IF NOT EXISTS settings (
-      chat_id TEXT PRIMARY KEY,
-      price_alerts INTEGER NOT NULL DEFAULT 1,
-      liq_alerts INTEGER NOT NULL DEFAULT 1,
-      risk_alerts INTEGER NOT NULL DEFAULT 1,
-      wallet_alerts INTEGER NOT NULL DEFAULT 1,
-      price_alert_pct REAL NOT NULL DEFAULT 5,
-      liq_alert_pct REAL NOT NULL DEFAULT 10,
-      cooldown_seconds INTEGER NOT NULL DEFAULT 900,
+    CREATE TABLE IF NOT EXISTS user_settings (
+      user_id TEXT PRIMARY KEY,
+      mode TEXT DEFAULT 'balanced',
+      alerts_enabled INTEGER DEFAULT 1,
+      launch_alerts INTEGER DEFAULT 1,
+      smart_alerts INTEGER DEFAULT 1,
+      risk_alerts INTEGER DEFAULT 1,
+      whale_alerts INTEGER DEFAULT 1,
+      explanation_level TEXT DEFAULT 'deep',
       created_at INTEGER NOT NULL,
       updated_at INTEGER NOT NULL
     )
@@ -265,1155 +161,3428 @@ async function initDb() {
     CREATE TABLE IF NOT EXISTS watchlist (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       chat_id TEXT NOT NULL,
-      query TEXT NOT NULL,
+      chain_id TEXT NOT NULL,
+      token_address TEXT NOT NULL,
       symbol TEXT,
-      contract_address TEXT,
-      chain_id TEXT,
       pair_address TEXT,
-      last_price REAL,
-      last_liquidity REAL,
-      last_risk_score REAL,
-      active INTEGER NOT NULL DEFAULT 1,
+      active INTEGER DEFAULT 1,
+      alerts_enabled INTEGER DEFAULT 1,
+      added_price REAL DEFAULT 0,
+      last_price REAL DEFAULT 0,
+      last_liquidity REAL DEFAULT 0,
+      last_volume REAL DEFAULT 0,
+      last_score INTEGER DEFAULT 0,
+      last_alert_ts INTEGER DEFAULT 0,
       created_at INTEGER NOT NULL,
+      updated_at INTEGER NOT NULL,
+      UNIQUE(chat_id, chain_id, token_address)
+    )
+  `);
+
+  await run(`
+    CREATE TABLE IF NOT EXISTS pair_memory (
+      memory_key TEXT PRIMARY KEY,
+      learned_bias REAL DEFAULT 0,
+      positive_events INTEGER DEFAULT 0,
+      negative_events INTEGER DEFAULT 0,
+      last_outcome TEXT,
+      last_price REAL DEFAULT 0,
+      last_liquidity REAL DEFAULT 0,
+      last_volume REAL DEFAULT 0,
+      last_seen_at INTEGER DEFAULT 0,
       updated_at INTEGER NOT NULL
     )
   `);
 
   await run(`
-    CREATE TABLE IF NOT EXISTS wallet_tracks (
+    CREATE TABLE IF NOT EXISTS scan_feedback (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
-      chat_id TEXT NOT NULL,
-      wallet TEXT NOT NULL,
-      label_type TEXT NOT NULL,
-      nickname TEXT NOT NULL,
-      chain_id TEXT NOT NULL DEFAULT 'solana',
-      active INTEGER NOT NULL DEFAULT 1,
-      alerts_enabled INTEGER NOT NULL DEFAULT 1,
-      last_seen_signature TEXT,
-      created_at INTEGER NOT NULL,
-      updated_at INTEGER NOT NULL
-    )
-  `);
-
-  await run(`
-    CREATE TABLE IF NOT EXISTS referrals (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      referrer_chat_id TEXT NOT NULL,
-      referred_chat_id TEXT NOT NULL,
-      code TEXT NOT NULL,
-      created_at INTEGER NOT NULL
-    )
-  `);
-
-  await run(`
-    CREATE UNIQUE INDEX IF NOT EXISTS idx_referrals_unique_pair
-    ON referrals(referrer_chat_id, referred_chat_id)
-  `);
-
-  await run(`
-    CREATE TABLE IF NOT EXISTS prompt_log (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      chat_id TEXT NOT NULL,
-      role TEXT NOT NULL,
-      content TEXT NOT NULL,
+      user_id TEXT,
+      chain_id TEXT,
+      token_address TEXT,
+      pair_address TEXT,
+      symbol TEXT,
+      feedback TEXT,
+      score_snapshot INTEGER,
       created_at INTEGER NOT NULL
     )
   `);
 }
 
-async function ensureUser(msg) {
-  const chatId = String(msg.chat.id);
+// ================= HELPERS =================
+function nowTs() {
+  return Math.floor(Date.now() / 1000);
+}
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function escapeHtml(value) {
+  return String(value || "")
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;");
+}
+
+function num(value, fallback = 0) {
+  const n = Number(value);
+  return Number.isFinite(n) ? n : fallback;
+}
+
+function clamp(value, min, max) {
+  return Math.max(min, Math.min(max, num(value)));
+}
+
+async function retryOperation(label, fn, options = {}) {
+  const {
+    attempts = 5,
+    baseDelay = 700,
+    maxDelay = 9000,
+    backoff = 1.8,
+    jitter = 200,
+    shouldRetry = () => true,
+    onRetry = null
+  } = options;
+
+  let lastErr = null;
+
+  for (let attempt = 1; attempt <= attempts; attempt++) {
+    try {
+      return await fn(attempt);
+    } catch (err) {
+      lastErr = err;
+      const retryable = shouldRetry(err, attempt);
+      if (!retryable || attempt === attempts) break;
+
+      const delay = Math.min(
+        maxDelay,
+        Math.floor(baseDelay * Math.pow(backoff, attempt - 1))
+      ) + Math.floor(Math.random() * jitter);
+
+      if (typeof onRetry === "function") {
+        try {
+          onRetry(err, attempt, delay);
+        } catch (_) {}
+      }
+
+      await sleep(delay);
+    }
+  }
+
+  throw lastErr || new Error(`${label} failed`);
+}
+
+function shortUsd(n) {
+  const x = num(n);
+  if (x >= 1_000_000_000) return `$${(x / 1_000_000_000).toFixed(2)}B`;
+  if (x >= 1_000_000) return `$${(x / 1_000_000).toFixed(2)}M`;
+  if (x >= 1_000) return `$${(x / 1_000).toFixed(2)}K`;
+  if (x >= 1) return `$${x.toFixed(4)}`;
+  return `$${x.toFixed(8)}`;
+}
+
+function shortAddr(value, len = 6) {
+  const s = String(value || "");
+  if (s.length <= len * 2 + 3) return s;
+  return `${s.slice(0, len)}...${s.slice(-len)}`;
+}
+
+function clip(value, len = 28) {
+  const s = String(value || "");
+  if (s.length <= len) return s;
+  return `${s.slice(0, len - 1)}…`;
+}
+
+function toPct(value, digits = 2) {
+  return `${num(value).toFixed(digits)}%`;
+}
+
+function sum(arr = []) {
+  return arr.reduce((a, b) => a + num(b), 0);
+}
+
+function isAddressLike(text) {
+  const t = String(text || "").trim();
+  return /^[1-9A-HJ-NP-Za-km-z]{32,44}$/.test(t) || /^0x[a-fA-F0-9]{40}$/.test(t);
+}
+
+function isLikelySolanaWallet(text) {
+  const t = String(text || "").trim();
+  return /^[1-9A-HJ-NP-Za-km-z]{32,44}$/.test(t);
+}
+
+function hasHelius() {
+  return !!HELIUS_API_KEY;
+}
+
+function hasEtherscanKey() {
+  return !!ETHERSCAN_API_KEY;
+}
+
+function supportsChain(chainId) {
+  return SUPPORTED_CHAINS.includes(String(chainId || "").toLowerCase());
+}
+
+function isEvmChain(chainId) {
+  const c = String(chainId || "").toLowerCase();
+  return c === "ethereum" || c === "base";
+}
+
+function humanChain(chainId) {
+  const c = String(chainId || "").toLowerCase();
+  if (c === "solana") return "Solana";
+  if (c === "base") return "Base";
+  if (c === "ethereum") return "Ethereum";
+  return clip(c, 18) || "Unknown";
+}
+
+function buildGeneratedStamp() {
+  return "Generated: just now";
+}
+
+function ageMinutesFromMs(createdAtMs) {
+  const ms = num(createdAtMs, 0);
+  if (!ms) return 0;
+  return Math.max(0, Math.floor((Date.now() - ms) / 60000));
+}
+
+function formatLaunchDate(createdAtMs) {
+  const ms = num(createdAtMs, 0);
+  if (!ms) return "Unknown";
+  const d = new Date(ms);
+  return d.toLocaleString("en-US", {
+    month: "short",
+    year: "numeric"
+  });
+}
+
+function ageFromMs(createdAtMs) {
+  const ms = num(createdAtMs, 0);
+  if (!ms) return "N/A";
+
+  const diffSec = Math.max(0, Math.floor((Date.now() - ms) / 1000));
+  const diffMin = Math.floor(diffSec / 60);
+  const diffHrs = Math.floor(diffMin / 60);
+  const diffDays = Math.floor(diffHrs / 24);
+
+  if (diffMin < 60) return `${diffMin}m`;
+  if (diffHrs < 24) return `${diffHrs}h`;
+  if (diffDays < 30) return `${diffDays}d`;
+
+  return formatLaunchDate(createdAtMs);
+}
+
+function makeDexUrl(chainId, pairAddress, fallbackUrl = "") {
+  if (fallbackUrl) return fallbackUrl;
+  if (!chainId || !pairAddress) return "";
+  return `https://dexscreener.com/${encodeURIComponent(chainId)}/${encodeURIComponent(pairAddress)}`;
+}
+
+function makeBirdeyeUrl(chainId, tokenAddress) {
+  const chain = String(chainId || "").toLowerCase();
+  const token = String(tokenAddress || "").trim();
+  if (!token) return "";
+  if (chain === "solana") {
+    return `https://birdeye.so/token/${encodeURIComponent(token)}?chain=solana`;
+  }
+  if (chain === "base") {
+    return `https://birdeye.so/token/${encodeURIComponent(token)}?chain=base`;
+  }
+  if (chain === "ethereum") {
+    return `https://birdeye.so/token/${encodeURIComponent(token)}?chain=ethereum`;
+  }
+  return "";
+}
+
+function makeGeckoUrl(chainId, pairAddress) {
+  const chain = String(chainId || "").toLowerCase();
+  const pair = String(pairAddress || "").trim();
+  if (!pair) return "";
+  if (chain === "solana") {
+    return `https://www.geckoterminal.com/solana/pools/${encodeURIComponent(pair)}`;
+  }
+  if (chain === "base") {
+    return `https://www.geckoterminal.com/base/pools/${encodeURIComponent(pair)}`;
+  }
+  if (chain === "ethereum") {
+    return `https://www.geckoterminal.com/eth/pools/${encodeURIComponent(pair)}`;
+  }
+  return "";
+}
+
+function getMsgChat(msgOrQuery) {
+  return msgOrQuery?.message?.chat || msgOrQuery?.chat || null;
+}
+
+function isPrivateChat(msgOrQuery) {
+  const chat = getMsgChat(msgOrQuery);
+  return chat?.type === "private";
+}
+
+function buildBotDeepLink() {
+  if (!BOT_USERNAME) return "";
+  return `https://t.me/${BOT_USERNAME}`;
+}
+
+// ================= USER / SUBSCRIPTION =================
+async function upsertUserFromMessage(msg, isSubscribed = 0) {
   const ts = nowTs();
-  const existing = await get(`SELECT * FROM users WHERE chat_id = ?`, [chatId]);
+  const userId = String(msg.from?.id || "");
+  const chatId = String(msg.chat?.id || "");
+  const username = msg.from?.username || "";
+  const firstName = msg.from?.first_name || "";
+  const lastName = msg.from?.last_name || "";
 
-  if (!existing) {
-    await run(
-  `INSERT OR IGNORE INTO users (chat_id, created_at) VALUES (?, ?)`,
-  [chatId, nowTs()]
-);
-  } else {
-    await run(
-      `UPDATE users
-       SET username = ?, first_name = ?, updated_at = ?
-       WHERE chat_id = ?`,
-      [msg.from?.username || "", msg.from?.first_name || "", ts, chatId]
-    );
-  }
+  if (!userId) return;
 
-  const settings = await get(`SELECT * FROM settings WHERE chat_id = ?`, [chatId]);
-  if (!settings) {
-    await run(
-      `INSERT INTO settings (chat_id, price_alerts, liq_alerts, risk_alerts, wallet_alerts, price_alert_pct, liq_alert_pct, cooldown_seconds, created_at, updated_at)
-       VALUES (?, 1, 1, 1, 1, ?, ?, ?, ?, ?)`,
-      [chatId, DEFAULT_ALERT_PCT, DEFAULT_LIQ_ALERT_PCT, ALERT_COOLDOWN_SECONDS, ts, ts]
-    );
-  }
-}
-
-async function setExpecting(chatId, value) {
-  await run(`UPDATE users SET expecting_input = ?, updated_at = ? WHERE chat_id = ?`, [value, nowTs(), String(chatId)]);
-}
-
-async function setMode(chatId, mode) {
-  await run(`UPDATE users SET mode = ?, updated_at = ? WHERE chat_id = ?`, [mode, nowTs(), String(chatId)]);
-}
-
-async function getUser(chatId) {
-  return get(`SELECT * FROM users WHERE chat_id = ?`, [String(chatId)]);
-}
-
-async function getSettings(chatId) {
-  return get(`SELECT * FROM settings WHERE chat_id = ?`, [String(chatId)]);
-}
-
-async function toggleSetting(chatId, field) {
-  const row = await getSettings(chatId);
-  const next = row && row[field] ? 0 : 1;
-  await run(`UPDATE settings SET ${field} = ?, updated_at = ? WHERE chat_id = ?`, [next, nowTs(), String(chatId)]);
-  return getSettings(chatId);
-}
-
-async function logPrompt(chatId, role, content) {
   await run(
-    `INSERT INTO prompt_log (chat_id, role, content, created_at)
-     VALUES (?, ?, ?, ?)`,
-    [String(chatId), role, String(content).slice(0, 4000), nowTs()]
+    `
+    INSERT INTO users (user_id, chat_id, username, first_name, last_name, is_subscribed, created_at, updated_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    ON CONFLICT(user_id) DO UPDATE SET
+      chat_id = excluded.chat_id,
+      username = excluded.username,
+      first_name = excluded.first_name,
+      last_name = excluded.last_name,
+      is_subscribed = excluded.is_subscribed,
+      updated_at = excluded.updated_at
+    `,
+    [userId, chatId, username, firstName, lastName, isSubscribed ? 1 : 0, ts, ts]
   );
 }
 
-async function getPromptHistory(chatId, limit = 8) {
-  const rows = await all(
-    `SELECT role, content FROM prompt_log
-     WHERE chat_id = ?
-     ORDER BY id DESC
-     LIMIT ?`,
-    [String(chatId), limit]
+async function setUserSubscription(userId, isSubscribed) {
+  await run(
+    `UPDATE users SET is_subscribed = ?, updated_at = ? WHERE user_id = ?`,
+    [isSubscribed ? 1 : 0, nowTs(), String(userId)]
   );
-  return rows.reverse();
 }
 
-async function verifyMembership(chatId) {
-  if (!CHANNEL_USERNAME) return true;
+async function getBotUserCount() {
+  const row = await get(`SELECT COUNT(*) AS c FROM users`, []);
+  return row?.c || 0;
+}
+
+async function getVerifiedSubscriberBotUsersCount() {
+  const row = await get(`SELECT COUNT(*) AS c FROM users WHERE is_subscribed = 1`, []);
+  return row?.c || 0;
+}
+
+async function getChannelSubscriberCount() {
   try {
-    const member = await bot.getChatMember(CHANNEL_USERNAME, chatId);
-    const ok = ["creator", "administrator", "member"].includes(member.status);
-    await run(`UPDATE users SET member_verified = ?, updated_at = ? WHERE chat_id = ?`, [ok ? 1 : 0, nowTs(), String(chatId)]);
+    const count = await bot.getChatMemberCount(REQUIRED_CHANNEL);
+    return count;
+  } catch (err) {
+    console.log("getChannelSubscriberCount error:", err.message);
+    return null;
+  }
+}
+
+function safeMode(mode) {
+  const m = String(mode || '').toLowerCase();
+  if (["aggressive", "balanced", "guardian"].includes(m)) return m;
+  return "balanced";
+}
+
+function modeTitle(mode) {
+  const m = safeMode(mode);
+  if (m === "aggressive") return "Aggressive";
+  if (m === "guardian") return "Guardian";
+  return "Balanced";
+}
+
+async function ensureUserSettings(userId) {
+  const ts = nowTs();
+  await run(
+    `INSERT OR IGNORE INTO user_settings (user_id, created_at, updated_at) VALUES (?, ?, ?)`,
+    [String(userId), ts, ts]
+  );
+}
+
+async function getUserSettings(userId) {
+  await ensureUserSettings(userId);
+  const row = await get(`SELECT * FROM user_settings WHERE user_id = ?`, [String(userId)]);
+  return row || {
+    user_id: String(userId),
+    mode: "balanced",
+    alerts_enabled: 1,
+    launch_alerts: 1,
+    smart_alerts: 1,
+    risk_alerts: 1,
+    whale_alerts: 1,
+    explanation_level: "deep"
+  };
+}
+
+async function setUserSetting(userId, field, value) {
+  const allowed = new Set([
+    "mode",
+    "alerts_enabled",
+    "launch_alerts",
+    "smart_alerts",
+    "risk_alerts",
+    "whale_alerts",
+    "explanation_level"
+  ]);
+  if (!allowed.has(field)) throw new Error(`Invalid setting field: ${field}`);
+  await ensureUserSettings(userId);
+  await run(
+    `UPDATE user_settings SET ${field} = ?, updated_at = ? WHERE user_id = ?`,
+    [value, nowTs(), String(userId)]
+  );
+}
+
+function getMemoryKey(pair) {
+  const chain = String(pair?.chainId || '').toLowerCase();
+  const token = String(pair?.baseAddress || pair?.pairAddress || '').toLowerCase();
+  return `${chain}:${token}`;
+}
+
+async function getPairMemory(pair) {
+  const key = getMemoryKey(pair);
+  const row = await get(`SELECT * FROM pair_memory WHERE memory_key = ?`, [key]);
+  return row || {
+    memory_key: key,
+    learned_bias: 0,
+    positive_events: 0,
+    negative_events: 0,
+    last_outcome: "none",
+    last_price: 0,
+    last_liquidity: 0,
+    last_volume: 0,
+    last_seen_at: 0
+  };
+}
+
+async function savePairMemorySnapshot(pair, verdictScore = null) {
+  const key = getMemoryKey(pair);
+  const old = await getPairMemory(pair);
+  const price = num(pair?.priceUsd);
+  const liquidity = num(pair?.liquidityUsd);
+  const volume = num(pair?.volumeH24);
+  let learnedBias = num(old.learned_bias);
+  let positive = num(old.positive_events);
+  let negative = num(old.negative_events);
+  let outcome = old.last_outcome || "none";
+
+  if (num(old.last_seen_at) > 0) {
+    const priceDelta = old.last_price > 0 ? ((price - old.last_price) / old.last_price) * 100 : 0;
+    const liqDelta = old.last_liquidity > 0 ? ((liquidity - old.last_liquidity) / old.last_liquidity) * 100 : 0;
+    const volDelta = old.last_volume > 0 ? ((volume - old.last_volume) / old.last_volume) * 100 : 0;
+
+    let signal = 0;
+    if (priceDelta >= 8) signal += 1;
+    if (liqDelta >= 10) signal += 1;
+    if (volDelta >= 15) signal += 1;
+    if (priceDelta <= -12) signal -= 1;
+    if (liqDelta <= -18) signal -= 1;
+
+    if (signal >= 2) {
+      learnedBias = Math.min(8, learnedBias + 1.25);
+      positive += 1;
+      outcome = "improving";
+    } else if (signal <= -2) {
+      learnedBias = Math.max(-10, learnedBias - 1.5);
+      negative += 1;
+      outcome = "weakening";
+    }
+  }
+
+  await run(
+    `INSERT INTO pair_memory (memory_key, learned_bias, positive_events, negative_events, last_outcome, last_price, last_liquidity, last_volume, last_seen_at, updated_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+     ON CONFLICT(memory_key) DO UPDATE SET
+       learned_bias = excluded.learned_bias,
+       positive_events = excluded.positive_events,
+       negative_events = excluded.negative_events,
+       last_outcome = excluded.last_outcome,
+       last_price = excluded.last_price,
+       last_liquidity = excluded.last_liquidity,
+       last_volume = excluded.last_volume,
+       last_seen_at = excluded.last_seen_at,
+       updated_at = excluded.updated_at`,
+    [key, learnedBias, positive, negative, outcome, price, liquidity, volume, nowTs(), nowTs()]
+  );
+
+  return { learnedBias, positive, negative, outcome, verdictScore };
+}
+
+async function addScanFeedback(userId, pair, feedback, scoreSnapshot = 0) {
+  await run(
+    `INSERT INTO scan_feedback (user_id, chain_id, token_address, pair_address, symbol, feedback, score_snapshot, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+    [
+      String(userId),
+      String(pair?.chainId || ''),
+      String(pair?.baseAddress || ''),
+      String(pair?.pairAddress || ''),
+      String(pair?.baseSymbol || ''),
+      String(feedback || ''),
+      num(scoreSnapshot),
+      nowTs()
+    ]
+  );
+
+  const current = await getPairMemory(pair);
+  let learnedBias = num(current.learned_bias);
+  let positive = num(current.positive_events);
+  let negative = num(current.negative_events);
+  let outcome = current.last_outcome || 'none';
+
+  if (feedback === 'good') {
+    learnedBias = Math.min(10, learnedBias + 2);
+    positive += 1;
+    outcome = 'user_confirmed_good';
+  } else if (feedback === 'bad') {
+    learnedBias = Math.max(-12, learnedBias - 2.5);
+    negative += 1;
+    outcome = 'user_confirmed_bad';
+  }
+
+  await run(
+    `INSERT INTO pair_memory (memory_key, learned_bias, positive_events, negative_events, last_outcome, last_price, last_liquidity, last_volume, last_seen_at, updated_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+     ON CONFLICT(memory_key) DO UPDATE SET
+       learned_bias = excluded.learned_bias,
+       positive_events = excluded.positive_events,
+       negative_events = excluded.negative_events,
+       last_outcome = excluded.last_outcome,
+       updated_at = excluded.updated_at`,
+    [getMemoryKey(pair), learnedBias, positive, negative, outcome, num(current.last_price), num(current.last_liquidity), num(current.last_volume), num(current.last_seen_at), nowTs()]
+  );
+}
+
+async function addWatchlistItem(chatId, pair) {
+  const ts = nowTs();
+  await run(
+    `INSERT INTO watchlist (chat_id, chain_id, token_address, symbol, pair_address, active, alerts_enabled, added_price, last_price, last_liquidity, last_volume, last_score, last_alert_ts, created_at, updated_at)
+     VALUES (?, ?, ?, ?, ?, 1, 1, ?, ?, ?, ?, 0, 0, ?, ?)
+     ON CONFLICT(chat_id, chain_id, token_address) DO UPDATE SET
+       symbol = excluded.symbol,
+       pair_address = excluded.pair_address,
+       last_price = excluded.last_price,
+       last_liquidity = excluded.last_liquidity,
+       last_volume = excluded.last_volume,
+       updated_at = excluded.updated_at,
+       active = 1`,
+    [
+      String(chatId),
+      String(pair.chainId || ''),
+      String(pair.baseAddress || ''),
+      String(pair.baseSymbol || ''),
+      String(pair.pairAddress || ''),
+      num(pair.priceUsd),
+      num(pair.priceUsd),
+      num(pair.liquidityUsd),
+      num(pair.volumeH24),
+      ts,
+      ts
+    ]
+  );
+}
+
+async function removeWatchlistItem(chatId, chainId, tokenAddress) {
+  await run(`DELETE FROM watchlist WHERE chat_id = ? AND chain_id = ? AND token_address = ?`, [String(chatId), String(chainId), String(tokenAddress)]);
+}
+
+async function getWatchlistItems(chatId) {
+  return await all(
+    `SELECT * FROM watchlist WHERE chat_id = ? AND active = 1 ORDER BY updated_at DESC LIMIT ?`,
+    [String(chatId), MAX_WATCHLIST_ITEMS]
+  );
+}
+
+async function getWatchlistCount(chatId) {
+  const row = await get(`SELECT COUNT(*) AS c FROM watchlist WHERE chat_id = ? AND active = 1`, [String(chatId)]);
+  return row?.c || 0;
+}
+
+function buildWatchlistItemCallback(chainId, tokenAddress) {
+  return `watch_open:${String(chainId)}:${String(tokenAddress)}`;
+}
+
+function explainBias(memory) {
+  const bias = num(memory?.learned_bias);
+  if (bias >= 5) return "Adaptive memory strongly positive";
+  if (bias >= 2) return "Adaptive memory slightly positive";
+  if (bias <= -5) return "Adaptive memory strongly negative";
+  if (bias <= -2) return "Adaptive memory slightly negative";
+  return "Adaptive memory neutral";
+}
+
+async function isUserSubscribed(userId) {
+  try {
+    const member = await bot.getChatMember(REQUIRED_CHANNEL, userId);
+    const ok = ["member", "administrator", "creator"].includes(member.status);
+    await setUserSubscription(userId, ok);
     return ok;
   } catch (err) {
-    console.error("membership check error:", err.message);
+    console.log(`isUserSubscribed error for ${userId}:`, err.message);
+    await setUserSubscription(userId, 0).catch(() => {});
     return false;
   }
 }
 
-function mustJoinMessage() {
-  const clean = CHANNEL_USERNAME.startsWith("@") ? CHANNEL_USERNAME : `@${CHANNEL_USERNAME}`;
-  return [
-    "<b>GorKtimus Access Gate</b>",
-    "",
-    "To use the terminal, join the official channel first.",
-    `Channel: <b>${escapeHtml(clean)}</b>`,
-    "",
-    "After joining, press <b>Verify Access</b>."
-  ].join("\n");
-}
-
-function buildVerifyButtons() {
-  const url = CHANNEL_USERNAME
-    ? `https://t.me/${String(CHANNEL_USERNAME).replace(/^@/, "")}`
-    : "https://t.me";
+function buildSubscriptionGate() {
   return {
     reply_markup: {
       inline_keyboard: [
-        [{ text: "Join Channel", url }],
-        [{ text: "Verify Access", callback_data: "verify_access" }]
+        [{ text: "📢 Join Channel", url: COMMUNITY_TELEGRAM_URL }],
+        [{ text: "✅ I Joined / Check Again", callback_data: "check_subscription" }]
       ]
-    },
-    parse_mode: "HTML"
+    }
   };
 }
 
-async function enforceMembership(chatId) {
-  if (!CHANNEL_USERNAME) return true;
-  const ok = await verifyMembership(chatId);
+async function showSubscriptionRequired(chatId) {
+  await sendMenu(
+    chatId,
+    `🧠 <b>Gorktimus Intelligence Terminal</b>\n\n🚫 <b>Access Locked</b>\n\nYou must join the official channel before using the bot.\n\nRequired channel: <b>${escapeHtml(
+      REQUIRED_CHANNEL
+    )}</b>`,
+    buildSubscriptionGate()
+  );
+}
+
+async function ensureSubscribedOrBlock(msgOrQuery) {
+  const from = msgOrQuery.from;
+  const chatId = msgOrQuery.message?.chat?.id || msgOrQuery.chat?.id;
+  if (!from?.id || !chatId) return false;
+
+  const ok = await isUserSubscribed(from.id);
   if (!ok) {
-    await sendText(chatId, mustJoinMessage(), buildVerifyButtons());
+    await showSubscriptionRequired(chatId);
     return false;
   }
   return true;
 }
 
-async function fetchDexSearch(query) {
-  const q = encodeURIComponent(normalizeText(query));
-  if (!q) return [];
-  const url = `https://api.dexscreener.com/latest/dex/search?q=${q}`;
-  const { data } = await axios.get(url, { timeout: 15000 });
-  return Array.isArray(data?.pairs) ? data.pairs : [];
-}
+// ================= MENUS =================
+function buildMainMenu() {
+  const growthRow = BOT_USERNAME
+    ? [{ text: "🚀 Invite Friends", callback_data: "invite_friends" }]
+    : [];
 
-async function fetchDexByTokenAddress(address) {
-  const url = `https://api.dexscreener.com/latest/dex/tokens/${encodeURIComponent(address)}`;
-  const { data } = await axios.get(url, { timeout: 15000 });
-  return Array.isArray(data?.pairs) ? data.pairs : [];
-}
+  const keyboard = [
+    [
+      { text: "🔎 Scan Token", callback_data: "scan_token" },
+      { text: "📈 Trending", callback_data: "trending" }
+    ],
+    [
+      { text: "📡 Launch Radar", callback_data: "launch_radar" },
+      { text: "⭐ Prime Picks", callback_data: "prime_picks" }
+    ],
+    [
+      { text: "👁 Watchlist", callback_data: "watchlist" },
+      { text: "🧬 Mode Lab", callback_data: "mode_lab" }
+    ],
+    [
+      { text: "🚨 Alert Center", callback_data: "alert_center" },
+      { text: "🐋 Whale Tracker", callback_data: "whale_menu" }
+    ],
+    [
+      { text: "🧠 Edge Brain", callback_data: "edge_brain" },
+      { text: "🤖 AI Assistant", callback_data: "ai_assistant" }
+    ],
+    [{ text: "❓ Help", callback_data: "help_menu" }]
+  ];
 
-async function fetchTrendingPairs() {
-  const url = `https://api.dexscreener.com/token-profiles/latest/v1`;
-  try {
-    const { data } = await axios.get(url, { timeout: 15000 });
-    if (Array.isArray(data)) return data;
-    return [];
-  } catch (_) {
-    return [];
-  }
-}
-
-function pickBestPair(pairs = []) {
-  if (!pairs.length) return null;
-  return [...pairs].sort((a, b) => {
-    const liqDiff = safeNum(b?.liquidity?.usd) - safeNum(a?.liquidity?.usd);
-    if (liqDiff !== 0) return liqDiff;
-    return safeNum(b?.volume?.h24) - safeNum(a?.volume?.h24);
-  })[0];
-}
-
-function pairAgeMinutes(pair) {
-  const created = safeNum(pair?.pairCreatedAt, 0);
-  if (!created) return null;
-  return Math.max(0, Math.floor((Date.now() - created) / 60000));
-}
-
-function buildSourceLines(pair) {
-  const lines = [];
-  if (pair?.url) lines.push(`DexScreener: ${pair.url}`);
-  if (pair?.baseToken?.address) {
-    lines.push(`GeckoTerminal: https://www.geckoterminal.com/search?query=${encodeURIComponent(pair.baseToken.address)}`);
-    lines.push(`Birdeye: https://birdeye.so/token/${encodeURIComponent(pair.baseToken.address)}?chain=solana`);
-  }
-  return lines;
-}
-
-function deriveWhyItMatters(metrics) {
-  const lines = [];
-  if (metrics.liquidity < 5000) lines.push("Low liquidity means exits can get ugly fast.");
-  if (metrics.marketCap > 0 && metrics.liquidity / metrics.marketCap < 0.02) lines.push("If liquidity is tiny compared to market cap, the chart can look stronger than the real exit path.");
-  if (metrics.volume24 > metrics.liquidity * 3 && metrics.liquidity > 0) lines.push("High volume relative to liquidity can signal strong attention, but it can also amplify volatility.");
-  if (metrics.sells24 > metrics.buys24 * 1.8 && metrics.sells24 > 30) lines.push("Sell dominance often means momentum is weakening or insiders are unloading.");
-  if ((metrics.ageMin || 999999) <= 20) lines.push("The first minutes of a launch are where both the biggest upside and the nastiest traps live.");
-  if (!lines.length) lines.push("This pair has a more neutral profile right now, so focus on timing, liquidity quality, and continued flow.");
-  return lines;
-}
-
-function scorePair(pair) {
-  const warnings = [];
-  const strengths = [];
-
-  const liquidity = safeNum(pair?.liquidity?.usd, 0);
-  const marketCap = safeNum(pair?.marketCap || pair?.fdv, 0);
-  const volume24 = safeNum(pair?.volume?.h24, 0);
-  const buys24 = safeNum(pair?.txns?.h24?.buys, 0);
-  const sells24 = safeNum(pair?.txns?.h24?.sells, 0);
-  const priceChange5m = safeNum(pair?.priceChange?.m5, 0);
-  const priceChange1h = safeNum(pair?.priceChange?.h1, 0);
-  const priceChange24h = safeNum(pair?.priceChange?.h24, 0);
-  const ageMin = pairAgeMinutes(pair);
-
-  let score = 55;
-
-  if (liquidity >= 100000) {
-    score += 15;
-    strengths.push("Strong liquidity base");
-  } else if (liquidity >= 25000) {
-    score += 7;
-    strengths.push("Moderate liquidity");
-  } else if (liquidity < 5000) {
-    score -= 18;
-    warnings.push("Very low liquidity");
-  }
-
-  if (marketCap > 0 && liquidity > 0) {
-    const liqToCap = liquidity / marketCap;
-    if (liqToCap >= 0.12) {
-      score += 8;
-      strengths.push("Healthy liquidity-to-cap ratio");
-    } else if (liqToCap < 0.02) {
-      score -= 10;
-      warnings.push("Thin liquidity versus market cap");
-    }
-  }
-
-  if (volume24 > liquidity * 3 && liquidity > 0) {
-    strengths.push("Strong volume relative to liquidity");
-    score += 4;
-  }
-
-  if (Math.abs(priceChange5m) > 35) {
-    warnings.push("Violent short-term price swing");
-    score -= 8;
-  }
-
-  if (priceChange1h < -35 || priceChange24h < -70) {
-    warnings.push("Heavy downside pressure");
-    score -= 10;
-  }
-
-  if (sells24 > buys24 * 1.8 && sells24 > 30) {
-    warnings.push("Sell pressure outweighs buys");
-    score -= 8;
-  } else if (buys24 > sells24 * 1.6 && buys24 > 30) {
-    strengths.push("Buy pressure stronger than sells");
-    score += 6;
-  }
-
-  if (ageMin !== null) {
-    if (ageMin <= 20) {
-      warnings.push("Very early launch - highest volatility zone");
-      score -= 7;
-    } else if (ageMin <= 180) {
-      strengths.push("Still early with observable market activity");
-      score += 2;
-    }
-  }
-
-  score = Math.max(1, Math.min(99, score));
-
-  let verdict = "Caution";
-  let recommendation = "Proceed carefully. Use small size and monitor liquidity.";
-  if (score >= 75) {
-    verdict = "Stronger Structure";
-    recommendation = "Structure looks healthier than average, but still verify entries and watch momentum.";
-  } else if (score <= 39) {
-    verdict = "High Risk";
-    recommendation = "Avoid chasing unless you are deliberately trading extreme risk.";
-  }
+  if (growthRow.length) keyboard.push(growthRow);
 
   return {
-    score,
-    verdict,
-    recommendation,
-    warnings,
-    strengths,
-    whyItMatters: deriveWhyItMatters({ liquidity, marketCap, volume24, buys24, sells24, ageMin })
+    reply_markup: {
+      inline_keyboard: keyboard
+    }
   };
 }
 
-function buildScanCard(pair, userMode = "balanced") {
-  const score = scorePair(pair);
-  const base = pair?.baseToken || {};
-  const quote = pair?.quoteToken || {};
-  const ageMin = pairAgeMinutes(pair);
+function buildHelpMenu() {
+  return {
+    reply_markup: {
+      inline_keyboard: [
+        [{ text: "📖 How Gorktimus Works", callback_data: "help_engine" }],
+        [{ text: "📊 Why It Differs From Dex", callback_data: "help_dex_diff" }],
+        [{ text: "🛡 Safety Score + Confidence", callback_data: "help_score" }],
+        [{ text: "🔄 Transactions / Flow Explained", callback_data: "help_transactions" }],
+        [{ text: "⚙️ Data Sources", callback_data: "help_sources" }],
+        [{ text: "💬 Contact / Community", callback_data: "help_community" }],
+        [{ text: "🏠 Main Menu", callback_data: "main_menu" }]
+      ]
+    }
+  };
+}
 
-  const lines = [
-    "<b>GorKtimus Risk Verdict</b>",
-    "",
-    `<b>${escapeHtml(score.verdict)}</b>`,
-    `Safety Score: <b>${score.score}/99</b>`,
-    `Recommendation: ${escapeHtml(score.recommendation)}`,
-    "",
-    "<b>Warnings</b>",
-    score.warnings.length ? score.warnings.map((w) => `- ${escapeHtml(w)}`).join("\n") : "- No major warning spike detected from available pair data.",
-    "",
-    "<b>Strengths</b>",
-    score.strengths.length ? score.strengths.map((s) => `- ${escapeHtml(s)}`).join("\n") : "- No clear strength edge yet.",
-    "",
-    "<b>Token Metrics</b>",
-    `Name: <b>${escapeHtml(base.name || "Unknown")}</b>`,
-    `Symbol: <b>${escapeHtml(base.symbol || "N/A")}</b>`,
-    `Chain: <b>${escapeHtml(pair?.chainId || "N/A")}</b>`,
-    `Pair: <code>${escapeHtml(shortAddr(pair?.pairAddress || "", 8, 6))}</code>`,
-    `Contract: <code>${escapeHtml(base.address || "N/A")}</code>`,
-    `Price: <b>${escapeHtml(pair?.priceUsd ? fmtUsd(pair.priceUsd) : "N/A")}</b>`,
-    `Liquidity: <b>${fmtUsd(pair?.liquidity?.usd)}</b>`,
-    `Market Cap: <b>${fmtUsd(pair?.marketCap || pair?.fdv)}</b>`,
-    `24H Volume: <b>${fmtUsd(pair?.volume?.h24)}</b>`,
-    `Buys/Sells 24H: <b>${fmtInt(pair?.txns?.h24?.buys)}/${fmtInt(pair?.txns?.h24?.sells)}</b>`,
-    `5M / 1H / 24H: <b>${fmtPct(pair?.priceChange?.m5)}</b> / <b>${fmtPct(pair?.priceChange?.h1)}</b> / <b>${fmtPct(pair?.priceChange?.h24)}</b>`,
-    `Age: <b>${ageMin === null ? "Unknown" : `${fmtInt(ageMin)} min`}</b>`
+function buildAIAssistantMenu() {
+  return {
+    reply_markup: {
+      inline_keyboard: [
+        [
+          { text: "📖 How It Works", callback_data: "help_engine" },
+          { text: "📊 Why Not Dex", callback_data: "help_dex_diff" }
+        ],
+        [
+          { text: "🔄 Transactions", callback_data: "help_transactions" },
+          { text: "🛡 Safety Score", callback_data: "help_score" }
+        ],
+        [
+          { text: "🔎 Scan Token", callback_data: "scan_token" },
+          { text: "🏠 Exit Assistant", callback_data: "main_menu" }
+        ]
+      ]
+    }
+  };
+}
+
+function buildWhaleMenu() {
+  return {
+    reply_markup: {
+      inline_keyboard: [
+        [
+          { text: "➕ Add Whale", callback_data: "add_whale" },
+          { text: "📋 Whale List", callback_data: "whale_list" }
+        ],
+        [
+          { text: "➕ Add Dev Wallet", callback_data: "add_dev" },
+          { text: "📋 Dev List", callback_data: "dev_list" }
+        ],
+        [
+          { text: "🔍 Check Wallet", callback_data: "check_wallet" },
+          { text: "⚙️ Alert Settings", callback_data: "wallet_alert_settings" }
+        ],
+        [{ text: "🏠 Main Menu", callback_data: "main_menu" }]
+      ]
+    }
+  };
+}
+
+function buildModeMenu(currentMode) {
+  const mode = safeMode(currentMode);
+  const mark = (name, title) => ({
+    text: mode === name ? `✅ ${title}` : title,
+    callback_data: `set_mode:${name}`
+  });
+  return {
+    reply_markup: {
+      inline_keyboard: [
+        [mark("aggressive", "A — Aggressive")],
+        [mark("balanced", "B — Balanced")],
+        [mark("guardian", "C — Guardian")],
+        [{ text: "🏠 Main Menu", callback_data: "main_menu" }]
+      ]
+    }
+  };
+}
+
+function buildAlertCenterMenu(settings) {
+  const mark = (v) => (num(v) ? "✅" : "❌");
+  return {
+    reply_markup: {
+      inline_keyboard: [
+        [{ text: `${mark(settings.alerts_enabled)} Master Alerts`, callback_data: "toggle_setting:alerts_enabled" }],
+        [
+          { text: `${mark(settings.launch_alerts)} Launch Alerts`, callback_data: "toggle_setting:launch_alerts" },
+          { text: `${mark(settings.smart_alerts)} Smart Alerts`, callback_data: "toggle_setting:smart_alerts" }
+        ],
+        [
+          { text: `${mark(settings.risk_alerts)} Risk Alerts`, callback_data: "toggle_setting:risk_alerts" },
+          { text: `${mark(settings.whale_alerts)} Whale Alerts`, callback_data: "toggle_setting:whale_alerts" }
+        ],
+        [{ text: "🏠 Main Menu", callback_data: "main_menu" }]
+      ]
+    }
+  };
+}
+
+function buildWatchlistMenu(rows) {
+  const buttons = rows.slice(0, MAX_WATCHLIST_ITEMS).map((row) => [{
+    text: `👁 ${clip(row.symbol || shortAddr(row.token_address, 6), 28)}`,
+    callback_data: buildWatchlistItemCallback(row.chain_id, row.token_address)
+  }]);
+  buttons.push([{ text: "🏠 Main Menu", callback_data: "main_menu" }]);
+  return { reply_markup: { inline_keyboard: buttons } };
+}
+
+function buildWatchlistItemMenu(pair) {
+  return {
+    reply_markup: {
+      inline_keyboard: [
+        [{ text: "🔁 Re-Scan", callback_data: `watch_rescan:${pair.chainId}:${pair.baseAddress}` }],
+        [{ text: "❌ Remove", callback_data: `watch_remove:${pair.chainId}:${pair.baseAddress}` }],
+        [
+          { text: "👍 Good Call", callback_data: `feedback:good:${pair.chainId}:${pair.baseAddress}` },
+          { text: "👎 Bad Call", callback_data: `feedback:bad:${pair.chainId}:${pair.baseAddress}` }
+        ],
+        [{ text: "👁 Watchlist", callback_data: "watchlist" }],
+        [{ text: "🏠 Main Menu", callback_data: "main_menu" }]
+      ]
+    }
+  };
+}
+
+function buildScanActionButtons(pair) {
+  return {
+    reply_markup: {
+      inline_keyboard: [
+        [
+          { text: "👁 Add Watchlist", callback_data: `watch_add:${pair.chainId}:${pair.baseAddress}` },
+          { text: "🔎 Scan Another", callback_data: "scan_token" }
+        ],
+        [
+          { text: "👍 Good Call", callback_data: `feedback:good:${pair.chainId}:${pair.baseAddress}` },
+          { text: "👎 Bad Call", callback_data: `feedback:bad:${pair.chainId}:${pair.baseAddress}` }
+        ],
+        [{ text: "🤖 Ask AI Assistant", callback_data: "ai_assistant" }],
+        [{ text: "🏠 Main Menu", callback_data: "main_menu" }]
+      ]
+    }
+  };
+}
+
+function buildMainMenuOnlyButton() {
+  return {
+    reply_markup: {
+      inline_keyboard: [[{ text: "🏠 Main Menu", callback_data: "main_menu" }]]
+    }
+  };
+}
+
+function buildRefreshMainButtons(refreshCallback) {
+  return {
+    reply_markup: {
+      inline_keyboard: [
+        [{ text: "🔄 Refresh", callback_data: refreshCallback }],
+        [{ text: "🏠 Main Menu", callback_data: "main_menu" }]
+      ]
+    }
+  };
+}
+
+function buildScanButtons() {
+  return {
+    reply_markup: {
+      inline_keyboard: [
+        [{ text: "🔎 Scan Another", callback_data: "scan_token" }],
+        [{ text: "🏠 Main Menu", callback_data: "main_menu" }]
+      ]
+    }
+  };
+}
+
+function buildWalletListMenu(rows, type) {
+  const buttons = rows.map((row) => [
+    {
+      text: `${type === "whale" ? "🐋" : "👤"} ${clip(row.nickname || shortAddr(row.wallet, 6), 28)}`,
+      callback_data: `wallet_item:${row.id}`
+    }
+  ]);
+
+  buttons.push([{ text: "🏠 Main Menu", callback_data: "main_menu" }]);
+
+  return {
+    reply_markup: {
+      inline_keyboard: buttons
+    }
+  };
+}
+
+function buildWalletItemMenu(row) {
+  const toggleText = row.alerts_enabled ? "⛔ Alerts Off" : "✅ Alerts On";
+  return {
+    reply_markup: {
+      inline_keyboard: [
+        [{ text: toggleText, callback_data: `wallet_toggle:${row.id}` }],
+        [{ text: "🔍 Check Now", callback_data: `wallet_check:${row.id}` }],
+        [{ text: "✏️ Rename", callback_data: `wallet_rename:${row.id}` }],
+        [{ text: "❌ Remove", callback_data: `wallet_remove:${row.id}` }],
+        [{ text: "🏠 Main Menu", callback_data: "main_menu" }]
+      ]
+    }
+  };
+}
+
+// ================= TELEGRAM SENDERS =================
+async function sendMessageWithRetry(chatId, text, opts, attempts = 3) {
+  let lastErr;
+  for (let i = 1; i <= attempts; i++) {
+    try {
+      return await bot.sendMessage(chatId, text, opts);
+    } catch (err) {
+      lastErr = err;
+      const msg = String(err?.message || "");
+      const retryable =
+        msg.includes("504") ||
+        msg.includes("Gateway Timeout") ||
+        msg.includes("429") ||
+        msg.includes("Too Many Requests") ||
+        msg.includes("ECONNRESET") ||
+        msg.includes("ETIMEDOUT");
+      if (!retryable || i === attempts) throw err;
+      await sleep(TELEGRAM_SEND_RETRY_MS * i);
+    }
+  }
+  throw lastErr;
+}
+
+async function sendPhotoWithRetry(chatId, photo, opts, attempts = 2) {
+  let lastErr;
+  for (let i = 1; i <= attempts; i++) {
+    try {
+      return await bot.sendPhoto(chatId, photo, opts);
+    } catch (err) {
+      lastErr = err;
+      const msg = String(err?.message || "");
+      const retryable =
+        msg.includes("504") ||
+        msg.includes("Gateway Timeout") ||
+        msg.includes("429") ||
+        msg.includes("Too Many Requests") ||
+        msg.includes("ECONNRESET") ||
+        msg.includes("ETIMEDOUT");
+      if (!retryable || i === attempts) throw err;
+      await sleep(TELEGRAM_SEND_RETRY_MS * i);
+    }
+  }
+  throw lastErr;
+}
+
+async function answerCallbackSafe(queryId, text = "") {
+  try {
+    await bot.answerCallbackQuery(queryId, text ? { text } : {});
+  } catch (err) {
+    const msg = String(err?.message || "");
+    if (msg.includes("query is too old") || msg.includes("query ID is invalid")) return;
+    console.log("callback answer failed:", msg);
+  }
+}
+
+async function sendMenu(chatId, caption, keyboard) {
+  const safeCaption =
+    caption ||
+    "🧠 <b>Gorktimus Intelligence Terminal</b>\n\nLive intelligence. Clean execution.";
+
+  try {
+    if (!fs.existsSync(TERMINAL_IMG)) {
+      await sendMessageWithRetry(chatId, safeCaption, {
+        ...keyboard,
+        parse_mode: "HTML",
+        disable_web_page_preview: true
+      });
+      return;
+    }
+
+    await sendPhotoWithRetry(chatId, fs.createReadStream(TERMINAL_IMG), {
+      caption: safeCaption,
+      ...keyboard,
+      parse_mode: "HTML"
+    });
+  } catch (err) {
+    console.log("sendMenu fallback:", err.message);
+    await sendMessageWithRetry(chatId, safeCaption, {
+      ...keyboard,
+      parse_mode: "HTML",
+      disable_web_page_preview: true
+    });
+  }
+}
+
+async function sendText(chatId, text, keyboard) {
+  await sendMessageWithRetry(chatId, text, {
+    ...keyboard,
+    parse_mode: "HTML",
+    disable_web_page_preview: true
+  });
+}
+
+async function sendCard(chatId, text, keyboard = {}, imageUrl = "") {
+  const safeText = text || "🧠 <b>Gorktimus Intelligence Terminal</b>";
+  if (imageUrl) {
+    try {
+      await sendPhotoWithRetry(chatId, imageUrl, {
+        caption: safeText,
+        ...keyboard,
+        parse_mode: "HTML"
+      });
+      return;
+    } catch (err) {
+      console.log("sendCard image fallback:", err.message);
+    }
+  }
+
+  await sendText(chatId, safeText, keyboard);
+}
+
+// ================= DEX HELPERS =================
+function rankPairQuality(pair) {
+  return (
+    num(pair.liquidity?.usd || pair.liquidityUsd) * 4 +
+    num(pair.volume?.h24 || pair.volumeH24) * 2 +
+    num(pair.marketCap) +
+    num(pair.txns?.m5?.buys || pair.buysM5) * 250 -
+    num(pair.txns?.m5?.sells || pair.sellsM5) * 100
+  );
+}
+
+function normalizePair(pair) {
+  if (!pair) return null;
+  return {
+    chainId: String(pair.chainId || ""),
+    dexId: String(pair.dexId || ""),
+    pairAddress: String(pair.pairAddress || ""),
+    pairCreatedAt: num(pair.pairCreatedAt || 0),
+    baseSymbol: String(pair.baseToken?.symbol || pair.baseSymbol || ""),
+    baseName: String(pair.baseToken?.name || pair.baseName || ""),
+    baseAddress: String(pair.baseToken?.address || pair.baseAddress || ""),
+    quoteSymbol: String(pair.quoteToken?.symbol || ""),
+    priceUsd: num(pair.priceUsd),
+    liquidityUsd: num(pair.liquidity?.usd || pair.liquidityUsd),
+    volumeH24: num(pair.volume?.h24 || pair.volumeH24),
+    buysM5: num(pair.txns?.m5?.buys || pair.buysM5),
+    sellsM5: num(pair.txns?.m5?.sells || pair.sellsM5),
+    txnsM5:
+      num(pair.txns?.m5?.buys || pair.buysM5) + num(pair.txns?.m5?.sells || pair.sellsM5),
+    marketCap: num(pair.marketCap || pair.fdv || pair.market_cap),
+    fdv: num(pair.fdv),
+    url: String(pair.url || ""),
+    imageUrl: String(
+      pair.info?.imageUrl ||
+        pair.info?.iconUrl ||
+        pair.imageUrl ||
+        pair.icon ||
+        ""
+    )
+  };
+}
+
+async function safeGet(url, timeout = DEX_TIMEOUT_MS) {
+  const res = await axios.get(url, { timeout });
+  return res.data;
+}
+
+async function rpcPost(url, body, timeout = HELIUS_TIMEOUT_MS) {
+  const res = await axios.post(url, body, {
+    timeout,
+    headers: { "Content-Type": "application/json" }
+  });
+  return res.data;
+}
+
+async function searchDexPairs(query) {
+  const data = await safeGet(
+    `https://api.dexscreener.com/latest/dex/search?q=${encodeURIComponent(query)}`
+  );
+  const pairs = Array.isArray(data?.pairs) ? data.pairs : [];
+  return pairs.map(normalizePair).filter((p) => p && supportsChain(p.chainId));
+}
+
+async function fetchPairsByToken(chainId, tokenAddress) {
+  const data = await safeGet(
+    `https://api.dexscreener.com/token-pairs/v1/${encodeURIComponent(chainId)}/${encodeURIComponent(
+      tokenAddress
+    )}`
+  );
+  const pairs = Array.isArray(data) ? data : [];
+  return pairs.map(normalizePair).filter((p) => p && supportsChain(p.chainId));
+}
+
+async function resolveBestPair(query) {
+  const q = String(query || "").trim();
+  if (!q) return null;
+
+  if (isAddressLike(q)) {
+    const chainCandidates = q.startsWith("0x") ? ["base", "ethereum"] : ["solana"];
+    const byTokenResults = [];
+
+    for (const chainId of chainCandidates) {
+      try {
+        const pairs = await fetchPairsByToken(chainId, q);
+        byTokenResults.push(...pairs);
+      } catch (err) {
+        console.log("resolveBestPair token route warning:", err.message);
+      }
+    }
+
+    if (byTokenResults.length) {
+      return byTokenResults.sort((a, b) => rankPairQuality(b) - rankPairQuality(a))[0];
+    }
+  }
+
+  try {
+    const pairs = await searchDexPairs(q);
+    if (!pairs.length) return null;
+
+    const lowered = q.toLowerCase();
+    return pairs
+      .sort((a, b) => {
+        const exactA = String(a.baseSymbol || "").toLowerCase() === lowered;
+        const exactB = String(b.baseSymbol || "").toLowerCase() === lowered;
+        if (exactA !== exactB) return exactB - exactA;
+        return rankPairQuality(b) - rankPairQuality(a);
+      })[0];
+  } catch (err) {
+    console.log("resolveBestPair search route error:", err.message);
+    return null;
+  }
+}
+
+async function fetchLatestProfiles() {
+  try {
+    const data = await safeGet("https://api.dexscreener.com/token-profiles/latest/v1");
+    return Array.isArray(data) ? data : [];
+  } catch (err) {
+    console.log("fetchLatestProfiles error:", err.message);
+    return [];
+  }
+}
+
+async function fetchLatestBoosts() {
+  try {
+    const data = await safeGet("https://api.dexscreener.com/token-boosts/latest/v1");
+    return Array.isArray(data) ? data : [];
+  } catch (err) {
+    console.log("fetchLatestBoosts error:", err.message);
+    return [];
+  }
+}
+
+async function fetchTokenOrders(chainId, tokenAddress) {
+  try {
+    const data = await safeGet(
+      `https://api.dexscreener.com/orders/v1/${encodeURIComponent(chainId)}/${encodeURIComponent(
+        tokenAddress
+      )}`
+    );
+    return Array.isArray(data) ? data : [];
+  } catch {
+    return [];
+  }
+}
+
+async function resolveTokenToBestPair(chainId, tokenAddress) {
+  try {
+    const pairs = await fetchPairsByToken(chainId, tokenAddress);
+    if (!pairs.length) return null;
+    return pairs.sort((a, b) => rankPairQuality(b) - rankPairQuality(a))[0];
+  } catch (err) {
+    console.log("resolveTokenToBestPair error:", err.message);
+    return null;
+  }
+}
+
+async function fetchTokenProfileImage(chainId, tokenAddress, fallbackPair = null) {
+  try {
+    if (fallbackPair?.imageUrl) return fallbackPair.imageUrl;
+
+    const profiles = await fetchLatestProfiles();
+    const hit = profiles.find(
+      (x) =>
+        String(x?.chainId || "").toLowerCase() === String(chainId || "").toLowerCase() &&
+        String(x?.tokenAddress || "") === String(tokenAddress || "")
+    );
+
+    if (!hit) return "";
+    return String(hit.icon || hit.imageUrl || hit.header || "");
+  } catch (err) {
+    console.log("fetchTokenProfileImage error:", err.message);
+    return "";
+  }
+}
+
+// ================= CHAIN INTELLIGENCE =================
+async function fetchHeliusTokenLargestAccounts(mintAddress) {
+  if (!hasHelius() || !mintAddress) return [];
+
+  try {
+    const rpcUrl = `https://mainnet.helius-rpc.com/?api-key=${encodeURIComponent(HELIUS_API_KEY)}`;
+    const data = await retryOperation(
+      "fetchHeliusTokenLargestAccounts",
+      async () => {
+        const out = await rpcPost(rpcUrl, {
+          jsonrpc: "2.0",
+          id: "gork-largest-accounts",
+          method: "getTokenLargestAccounts",
+          params: [mintAddress]
+        });
+
+        if (!Array.isArray(out?.result?.value)) {
+          throw new Error("Largest accounts payload missing");
+        }
+
+        return out;
+      },
+      {
+        attempts: 6,
+        baseDelay: 900,
+        maxDelay: 12000,
+        backoff: 2,
+        shouldRetry: (err) => {
+          const status = err?.response?.status;
+          return [408, 425, 429, 500, 502, 503, 504].includes(status) ||
+            err?.code === "ECONNABORTED" ||
+            err?.code === "ETIMEDOUT" ||
+            err?.code === "ECONNRESET";
+        },
+        onRetry: (err, attempt, delay) => {
+          console.log(
+            `fetchHeliusTokenLargestAccounts retry ${attempt} in ${delay}ms:`,
+            err?.response?.status || err.message
+          );
+        }
+      }
+    );
+
+    const rows = Array.isArray(data?.result?.value) ? data.result.value : [];
+    return rows.map((x) => ({
+      address: String(x.address || ""),
+      amountRaw: String(x.amount || "0"),
+      uiAmount: num(x.uiAmountString ?? x.uiAmount ?? 0),
+      decimals: num(x.decimals, 0)
+    }));
+  } catch (err) {
+    console.log("fetchHeliusTokenLargestAccounts error:", err?.response?.status || err.message);
+    return [];
+  }
+}
+
+function analyzeSolanaHolderConcentration(largestAccounts = []) {
+  if (!largestAccounts.length) {
+    return {
+      label: "Unknown",
+      emoji: "⚠️",
+      score: 6,
+      top1Pct: 0,
+      top5Pct: 0,
+      top10Pct: 0,
+      holdersKnown: 0,
+      detail: "No holder concentration data returned"
+    };
+  }
+
+  const balances = largestAccounts.map((x) => num(x.uiAmount));
+  const totalTop20 = sum(balances);
+
+  if (totalTop20 <= 0) {
+    return {
+      label: "Unknown",
+      emoji: "⚠️",
+      score: 6,
+      top1Pct: 0,
+      top5Pct: 0,
+      top10Pct: 0,
+      holdersKnown: largestAccounts.length,
+      detail: "Largest accounts returned zeroed balances"
+    };
+  }
+
+  const top1Pct = (sum(balances.slice(0, 1)) / totalTop20) * 100;
+  const top5Pct = (sum(balances.slice(0, 5)) / totalTop20) * 100;
+  const top10Pct = (sum(balances.slice(0, 10)) / totalTop20) * 100;
+
+  let label = "Moderate";
+  let emoji = "⚠️";
+  let score = 8;
+
+  if (top1Pct >= 60 || top5Pct >= 90) {
+    label = "Very High";
+    emoji = "🚨";
+    score = 1;
+  } else if (top1Pct >= 35 || top5Pct >= 75) {
+    label = "High";
+    emoji = "⚠️";
+    score = 4;
+  } else if (top1Pct <= 15 && top5Pct <= 45) {
+    label = "Lower";
+    emoji = "✅";
+    score = 14;
+  }
+
+  return {
+    label,
+    emoji,
+    score,
+    top1Pct,
+    top5Pct,
+    top10Pct,
+    holdersKnown: largestAccounts.length,
+    detail: `Top 1: ${toPct(top1Pct)} | Top 5: ${toPct(top5Pct)} | Top 10: ${toPct(top10Pct)}`
+  };
+}
+
+async function fetchEvmHoneypot(address, chainId) {
+  if (!address || !isEvmChain(chainId)) return null;
+
+  const chain = String(chainId).toLowerCase();
+  const mappedChainId = EVM_CHAIN_IDS[chain];
+
+  const strategies = [
+    async () => {
+      const res = await axios.get(`${HONEYPOT_API_BASE}/v2/IsHoneypot`, {
+        timeout: DEX_TIMEOUT_MS,
+        params: { address, chainID: mappedChainId }
+      });
+      return res.data || null;
+    },
+    async () => {
+      const res = await axios.get(`${HONEYPOT_API_BASE}/v2/IsHoneypot`, {
+        timeout: DEX_TIMEOUT_MS,
+        params: { address }
+      });
+      return res.data || null;
+    },
+    async () => {
+      const res = await axios.get(`${HONEYPOT_API_BASE}/IsHoneypot`, {
+        timeout: DEX_TIMEOUT_MS,
+        params: { address, chainID: mappedChainId }
+      });
+      return res.data || null;
+    }
   ];
 
-  if (userMode !== "fast") {
-    lines.push("", "<b>Why It Matters</b>");
-    for (const item of score.whyItMatters) lines.push(`- ${escapeHtml(item)}`);
+  let lastErr = null;
+
+  for (let i = 0; i < strategies.length; i++) {
+    try {
+      return await retryOperation(
+        `fetchEvmHoneypot:${i + 1}`,
+        async () => {
+          const result = await strategies[i]();
+          if (!result) throw new Error("Empty honeypot payload");
+          return result;
+        },
+        {
+          attempts: 3,
+          baseDelay: 850,
+          maxDelay: 5000,
+          backoff: 1.7,
+          shouldRetry: (err) => {
+            const status = err?.response?.status;
+            return [408, 425, 429, 500, 502, 503, 504].includes(status) ||
+              err?.code === "ECONNABORTED" ||
+              err?.code === "ETIMEDOUT" ||
+              err?.code === "ECONNRESET";
+          },
+          onRetry: (err, attempt, delay) => {
+            console.log(
+              `fetchEvmHoneypot strategy ${i + 1} retry ${attempt} in ${delay}ms:`,
+              err?.response?.status || err.message
+            );
+          }
+        }
+      );
+    } catch (err) {
+      lastErr = err;
+      console.log(
+        `fetchEvmHoneypot strategy ${i + 1} failed:`,
+        err?.response?.status || err.message
+      );
+    }
   }
 
-  if (userMode === "deep") {
-    lines.push(
-      "",
-      "<b>Deep Defense Layer</b>",
-      `Quote Token: <b>${escapeHtml(quote.symbol || "N/A")}</b>`,
-      `DEX: <b>${escapeHtml(pair?.dexId || "N/A")}</b>`,
-      `FDV: <b>${fmtUsd(pair?.fdv)}</b>`,
-      `Txn 5M Buys/Sells: <b>${fmtInt(pair?.txns?.m5?.buys)}/${fmtInt(pair?.txns?.m5?.sells)}</b>`,
-      `Txn 1H Buys/Sells: <b>${fmtInt(pair?.txns?.h1?.buys)}/${fmtInt(pair?.txns?.h1?.sells)}</b>`
+  if (lastErr) {
+    console.log("fetchEvmHoneypot final failure:", lastErr?.response?.status || lastErr.message);
+  }
+
+  return null;
+}
+
+async function fetchEvmTopHolders(address, chainId) {
+  if (!address || !isEvmChain(chainId)) return null;
+
+  const chain = String(chainId).toLowerCase();
+  const mappedChainId = EVM_CHAIN_IDS[chain];
+
+  try {
+    return await retryOperation(
+      "fetchEvmTopHolders",
+      async () => {
+        const url = `${HONEYPOT_API_BASE}/v1/TopHolders`;
+        const res = await axios.get(url, {
+          timeout: DEX_TIMEOUT_MS,
+          params: {
+            address,
+            chainID: mappedChainId
+          }
+        });
+
+        return res.data || null;
+      },
+      {
+        attempts: 5,
+        baseDelay: 900,
+        maxDelay: 7000,
+        backoff: 1.8,
+        shouldRetry: (err) => {
+          const status = err?.response?.status;
+          return [408, 425, 429, 500, 502, 503, 504].includes(status) ||
+            err?.code === "ECONNABORTED" ||
+            err?.code === "ETIMEDOUT" ||
+            err?.code === "ECONNRESET";
+        },
+        onRetry: (err, attempt, delay) => {
+          console.log(
+            `fetchEvmTopHolders retry ${attempt} in ${delay}ms:`,
+            err?.response?.status || err.message
+          );
+        }
+      }
     );
+  } catch (err) {
+    console.log("fetchEvmTopHolders error:", err?.response?.status || err.message);
+    return null;
+  }
+}
+
+function analyzeEvmTopHolders(data) {
+  const totalSupply = num(data?.totalSupply);
+  const holders = Array.isArray(data?.holders) ? data.holders : [];
+
+  if (!holders.length || totalSupply <= 0) {
+    return {
+      label: "Unknown",
+      emoji: "⚠️",
+      score: 6,
+      top1Pct: 0,
+      top5Pct: 0,
+      top10Pct: 0,
+      holdersKnown: 0,
+      detail: "No top holder data returned"
+    };
   }
 
-  const sources = buildSourceLines(pair);
-  if (sources.length) {
-    lines.push("", "<b>Sources</b>");
-    for (const item of sources) lines.push(escapeHtml(item));
+  const balances = holders.map((h) => num(h.balance));
+  const top1Pct = (sum(balances.slice(0, 1)) / totalSupply) * 100;
+  const top5Pct = (sum(balances.slice(0, 5)) / totalSupply) * 100;
+  const top10Pct = (sum(balances.slice(0, 10)) / totalSupply) * 100;
+
+  let label = "Moderate";
+  let emoji = "⚠️";
+  let score = 8;
+
+  if (top1Pct >= 30 || top5Pct >= 70) {
+    label = "High";
+    emoji = "⚠️";
+    score = 4;
+  } else if (top1Pct <= 10 && top5Pct <= 30) {
+    label = "Lower";
+    emoji = "✅";
+    score = 14;
   }
+
+  return {
+    label,
+    emoji,
+    score,
+    top1Pct,
+    top5Pct,
+    top10Pct,
+    holdersKnown: holders.length,
+    detail: `Top 1: ${toPct(top1Pct)} | Top 5: ${toPct(top5Pct)} | Top 10: ${toPct(top10Pct)}`
+  };
+}
+
+
+function analyzeExecutionBehavior(pair) {
+  const buys = num(pair?.buysM5);
+  const sells = num(pair?.sellsM5);
+  const txns = num(pair?.txnsM5);
+  const liquidity = num(pair?.liquidityUsd);
+  const volume = num(pair?.volumeH24);
+  const avgUsdPerRecentTxn = txns > 0 ? volume / Math.max(txns, 1) : volume;
+
+  let spamLabel = "No strong spam signature";
+  let coordinationLabel = "No obvious coordinated buy pattern";
+  let flowLabel = "Mixed recent flow";
+  let penalty = 0;
+  const notes = [];
+
+  if (buys > sells * 1.8 && txns >= 8) {
+    flowLabel = "Positive momentum pressure";
+  } else if (sells > buys * 1.4 && txns >= 8) {
+    flowLabel = "Distribution pressure";
+  }
+
+  if (txns >= 25 && liquidity < 25000 && avgUsdPerRecentTxn < 1500) {
+    spamLabel = "Possible transaction spam";
+    penalty += 4;
+    notes.push("Recent transaction count looks loud relative to thin liquidity and average size.");
+  }
+
+  if (buys >= 18 && sells <= 1 && liquidity < 25000) {
+    coordinationLabel = "Possible coordinated buy burst";
+    penalty += 5;
+    notes.push("Buy flow is extremely one-sided and can be manufactured in thin books.");
+  } else if (buys >= 12 && sells === 0 && liquidity < 15000) {
+    coordinationLabel = "Elevated coordinated-flow risk";
+    penalty += 3;
+    notes.push("Near one-way buys in thin liquidity deserve caution.");
+  }
+
+  if (!notes.length) {
+    notes.push("No dominant flow-manipulation signature from the current lightweight behavior checks.");
+  }
+
+  return {
+    spamLabel,
+    coordinationLabel,
+    flowLabel,
+    penalty,
+    detail: notes.join(" ")
+  };
+}
+
+function buildConfidenceMeta(sourceChecks, behaviorPenalty = 0) {
+  const available = num(sourceChecks?.available);
+  const expected = Math.max(1, num(sourceChecks?.expected, 1));
+  const ratio = available / expected;
+
+  let confidence = "Medium";
+  let integrity = "Partial";
+
+  if (ratio >= 0.9 && behaviorPenalty <= 2) {
+    confidence = "High";
+    integrity = "Verified";
+  } else if (ratio >= 0.6) {
+    confidence = "Medium";
+    integrity = behaviorPenalty >= 5 ? "Mixed" : "Partial";
+  } else {
+    confidence = "Low";
+    integrity = "Weak";
+  }
+
+  return {
+    confidence,
+    integrity,
+    checksText: `${available}/${expected} source checks`
+  };
+}
+
+async function fetchEtherscanSourceCode(address, chainId) {
+  if (!hasEtherscanKey() || !address || !isEvmChain(chainId)) return null;
+
+  try {
+    const chain = String(chainId).toLowerCase();
+    const res = await axios.get(ETHERSCAN_V2_URL, {
+      timeout: DEX_TIMEOUT_MS,
+      params: {
+        apikey: ETHERSCAN_API_KEY,
+        chainid: String(EVM_CHAIN_IDS[chain]),
+        module: "contract",
+        action: "getsourcecode",
+        address
+      }
+    });
+
+    const result = Array.isArray(res.data?.result) ? res.data.result[0] : null;
+    return result || null;
+  } catch (err) {
+    console.log("fetchEtherscanSourceCode error:", err.message);
+    return null;
+  }
+}
+
+// ================= GORKTIMUS RISK VERDICT =================
+function getLiquidityHealth(liquidityUsd) {
+  const liq = num(liquidityUsd);
+  if (liq >= 100000) return { label: "Strong", emoji: "✅", score: 22 };
+  if (liq >= 40000) return { label: "Healthy", emoji: "✅", score: 18 };
+  if (liq >= 15000) return { label: "Moderate", emoji: "⚠️", score: 10 };
+  if (liq > 0) return { label: "Weak", emoji: "⚠️", score: 4 };
+  return { label: "Unknown", emoji: "⚠️", score: 0 };
+}
+
+function getAgeRisk(ageMin) {
+  if (!ageMin) return { label: "Unknown", score: 0 };
+  if (ageMin < 5) return { label: "Extremely Fresh", score: 2 };
+  if (ageMin < 30) return { label: "Very Early", score: 5 };
+  if (ageMin < 180) return { label: "Early", score: 10 };
+  if (ageMin < 1440) return { label: "Developing", score: 14 };
+  return { label: "Established", score: 18 };
+}
+
+function getFlowHealth(pair) {
+  const buys = num(pair.buysM5);
+  const sells = num(pair.sellsM5);
+  const total = buys + sells;
+
+  if (total === 0) return { label: "Limited Recent Flow", score: 4 };
+
+  const ratio = buys / Math.max(sells, 1);
+
+  if (ratio >= 2.5 && buys >= 10) return { label: "Strong Buy Pressure", score: 18 };
+  if (ratio >= 1.3) return { label: "Positive Flow", score: 12 };
+  if (ratio >= 0.85) return { label: "Mixed Flow", score: 7 };
+  return { label: "Sell Pressure", score: 2 };
+}
+
+function getVolumeHealth(volumeH24) {
+  const vol = num(volumeH24);
+  if (vol >= 500000) return { label: "Strong", score: 18 };
+  if (vol >= 100000) return { label: "Healthy", score: 14 };
+  if (vol >= 25000) return { label: "Moderate", score: 8 };
+  if (vol > 0) return { label: "Light", score: 4 };
+  return { label: "Unknown", score: 0 };
+}
+
+function buildRecommendation(score, ageMin, pair, verdictMeta = {}) {
+  const liq = num(pair.liquidityUsd);
+  const buys = num(pair.buysM5);
+  const sells = num(pair.sellsM5);
+
+  if (verdictMeta.isHoneypot === true) {
+    return "Avoid. Simulation and risk signals point to honeypot behavior.";
+  }
+  if (num(verdictMeta.sellTax) >= 25 || num(verdictMeta.buyTax) >= 25) {
+    return "High caution. Token taxes are elevated and can crush exits.";
+  }
+  if (liq < 10000) {
+    return "High risk. Liquidity is thin, so even small exits can hit price hard.";
+  }
+  if (verdictMeta.holderTop5Pct >= 75) {
+    return "Caution. Supply looks concentrated, which increases dump and control risk.";
+  }
+  if (ageMin > 0 && ageMin < 10) {
+    return "Ultra-early token. Watch closely before sizing in because conditions can change fast.";
+  }
+  if (sells > buys * 1.2) {
+    return "Caution. Recent order flow leans bearish, so momentum is not yet convincing.";
+  }
+  if (score >= 75) {
+    return "Stronger setup than most. Still use discipline, but current market structure looks healthier.";
+  }
+  if (score >= 55) {
+    return "Proceed with caution. Some structure is there, but this still needs confirmation.";
+  }
+  return "Speculative setup. Treat this as a high-risk play until more data matures.";
+}
+
+async function buildRiskVerdict(pair, userId = null) {
+  const ageMin = ageMinutesFromMs(pair.pairCreatedAt);
+  const liquidity = getLiquidityHealth(pair.liquidityUsd);
+  const age = getAgeRisk(ageMin);
+  const flow = getFlowHealth(pair);
+  const volume = getVolumeHealth(pair.volumeH24);
+  const behavior = analyzeExecutionBehavior(pair);
+
+  let transparencyLabel = "Unknown";
+  let transparencyEmoji = "⚠️";
+  let transparencyScore = 4;
+  let transparencyDetail = "";
+
+  let honeypotLabel = "Unknown";
+  let honeypotEmoji = "⚠️";
+  let honeypotScore = 6;
+  let honeypotDetail = "";
+
+  let holderLabel = "Unknown";
+  let holderEmoji = "⚠️";
+  let holderScore = 6;
+  let holderDetail = "";
+
+  let buyTax = null;
+  let sellTax = null;
+  let transferTax = null;
+  let holderTop5Pct = 0;
+  let isHoneypot = null;
+  let sourceChecks = { available: 1, expected: 3 };
+
+  const settings = userId ? await getUserSettings(userId) : { mode: "balanced" };
+  const mode = safeMode(settings?.mode);
+  const memory = await getPairMemory(pair);
+  const chain = String(pair.chainId || "").toLowerCase();
+
+  if (chain === "solana") {
+    const largestAccounts = await fetchHeliusTokenLargestAccounts(pair.baseAddress);
+    const holderInfo = analyzeSolanaHolderConcentration(largestAccounts);
+
+    holderLabel = holderInfo.label;
+    holderEmoji = holderInfo.emoji;
+    holderScore = holderInfo.score;
+    holderDetail = holderInfo.detail;
+    holderTop5Pct = holderInfo.top5Pct;
+
+    const orders = await fetchTokenOrders(pair.chainId, pair.baseAddress);
+    const approvedCount = orders.filter((x) => x?.status === "approved").length;
+
+    if (approvedCount >= 2) {
+      transparencyLabel = "Better Signal";
+      transparencyEmoji = "✅";
+      transparencyScore = 14;
+    } else if (approvedCount >= 1) {
+      transparencyLabel = "Some Signal";
+      transparencyEmoji = "⚠️";
+      transparencyScore = 10;
+    } else {
+      transparencyLabel = "Limited";
+      transparencyEmoji = "⚠️";
+      transparencyScore = 5;
+    }
+
+    transparencyDetail = approvedCount
+      ? `Dex order approvals detected: ${approvedCount}`
+      : "No extra order approval signal detected";
+
+    honeypotLabel = "Not Fully Testable";
+    honeypotEmoji = "⚠️";
+    honeypotScore = 8;
+    honeypotDetail = "Solana honeypot simulation is limited in this stack, so safety is inferred more from structure than direct trap simulation.";
+
+    sourceChecks = {
+      available: 1 + (largestAccounts.length ? 1 : 0) + 1,
+      expected: 3
+    };
+  } else if (isEvmChain(chain)) {
+    const [honeypotData, topHoldersData, etherscanData] = await Promise.all([
+      fetchEvmHoneypot(pair.baseAddress, chain),
+      fetchEvmTopHolders(pair.baseAddress, chain),
+      fetchEtherscanSourceCode(pair.baseAddress, chain)
+    ]);
+
+    if (honeypotData?.summary) {
+      const risk = String(honeypotData.summary.risk || "").toLowerCase();
+      const riskLevel = num(honeypotData.summary.riskLevel, 0);
+      isHoneypot = honeypotData?.honeypotResult?.isHoneypot === true;
+
+      buyTax = honeypotData?.simulationResult?.buyTax ?? null;
+      sellTax = honeypotData?.simulationResult?.sellTax ?? null;
+      transferTax = honeypotData?.simulationResult?.transferTax ?? null;
+
+      if (isHoneypot || risk === "honeypot" || riskLevel >= 90) {
+        honeypotLabel = "Detected";
+        honeypotEmoji = "🚨";
+        honeypotScore = 0;
+      } else if (riskLevel >= 60) {
+        honeypotLabel = `High Risk (${risk || "high"})`;
+        honeypotEmoji = "⚠️";
+        honeypotScore = 2;
+      } else if (riskLevel >= 20) {
+        honeypotLabel = `Medium Risk (${risk || "medium"})`;
+        honeypotEmoji = "⚠️";
+        honeypotScore = 6;
+      } else {
+        honeypotLabel = `Clearer (${risk || "low"})`;
+        honeypotEmoji = "✅";
+        honeypotScore = 14;
+      }
+
+      const taxBits = [];
+      if (buyTax !== null) taxBits.push(`Buy tax: ${buyTax}%`);
+      if (sellTax !== null) taxBits.push(`Sell tax: ${sellTax}%`);
+      if (transferTax !== null) taxBits.push(`Transfer tax: ${transferTax}%`);
+      honeypotDetail = taxBits.join(" | ");
+
+      if (num(sellTax) >= 30 || num(buyTax) >= 30) {
+        honeypotScore = Math.min(honeypotScore, 2);
+      } else if (num(sellTax) >= 15 || num(buyTax) >= 15) {
+        honeypotScore = Math.min(honeypotScore, 6);
+      }
+    } else {
+      honeypotLabel = "Unavailable";
+      honeypotEmoji = "⚠️";
+      honeypotScore = 5;
+      honeypotDetail = "No honeypot simulation response returned";
+    }
+
+    const holderInfo = analyzeEvmTopHolders(topHoldersData);
+    holderLabel = holderInfo.label;
+    holderEmoji = holderInfo.emoji;
+    holderScore = holderInfo.score;
+    holderDetail = holderInfo.detail;
+    holderTop5Pct = holderInfo.top5Pct;
+
+    if (honeypotData?.contractCode) {
+      const code = honeypotData.contractCode;
+      const openSource = code.openSource === true || code.rootOpenSource === true;
+      const proxyRisk = code.hasProxyCalls === true || code.isProxy === true;
+
+      if (openSource && !proxyRisk) {
+        transparencyLabel = "Verified Open Source";
+        transparencyEmoji = "✅";
+        transparencyScore = 16;
+      } else if (openSource && proxyRisk) {
+        transparencyLabel = "Open Source + Proxy";
+        transparencyEmoji = "⚠️";
+        transparencyScore = 10;
+      } else {
+        transparencyLabel = "Closed / Limited";
+        transparencyEmoji = "⚠️";
+        transparencyScore = 3;
+      }
+
+      transparencyDetail = [
+        `Open source: ${openSource ? "yes" : "no"}`,
+        `Proxy path: ${proxyRisk ? "yes" : "no"}`
+      ].join(" | ");
+    } else if (etherscanData) {
+      const sourceCode = String(etherscanData.SourceCode || "").trim();
+      const abi = String(etherscanData.ABI || "").trim();
+      const implementation = String(etherscanData.Implementation || "").trim();
+      const proxy = String(etherscanData.Proxy || "0").trim() === "1";
+
+      const hasSource = !!sourceCode && sourceCode !== "0";
+      const hasAbi = !!abi && abi !== "Contract source code not verified";
+
+      if (hasSource || hasAbi) {
+        transparencyLabel = proxy ? "Verified + Proxy" : "Verified";
+        transparencyEmoji = proxy ? "⚠️" : "✅";
+        transparencyScore = proxy ? 11 : 15;
+      } else {
+        transparencyLabel = "Unverified";
+        transparencyEmoji = "⚠️";
+        transparencyScore = 3;
+      }
+
+      transparencyDetail = [
+        `Source: ${hasSource ? "yes" : "no"}`,
+        `ABI: ${hasAbi ? "yes" : "no"}`,
+        `Proxy: ${proxy || implementation ? "yes" : "no"}`
+      ].join(" | ");
+    } else {
+      transparencyLabel = hasEtherscanKey() ? "Unavailable" : "No Etherscan Key";
+      transparencyEmoji = "⚠️";
+      transparencyScore = hasEtherscanKey() ? 4 : 2;
+      transparencyDetail = hasEtherscanKey()
+        ? "Explorer verification response unavailable"
+        : "Set ETHERSCAN_API_KEY for contract verification fallback";
+    }
+
+    sourceChecks = {
+      available:
+        1 +
+        (honeypotData ? 1 : 0) +
+        (topHoldersData ? 1 : 0) +
+        (honeypotData?.contractCode || etherscanData ? 1 : 0),
+      expected: 4
+    };
+  }
+
+  let rawScore =
+    liquidity.score +
+    age.score +
+    flow.score +
+    volume.score +
+    transparencyScore +
+    honeypotScore +
+    holderScore;
+
+  rawScore -= behavior.penalty;
+
+  if (mode === "aggressive") {
+    rawScore += ageMin > 0 && ageMin < 120 ? 6 : 0;
+    rawScore += num(pair.buysM5) > num(pair.sellsM5) ? 4 : 0;
+    rawScore -= num(pair.liquidityUsd) < 15000 ? 2 : 0;
+  } else if (mode === "guardian") {
+    rawScore -= num(pair.liquidityUsd) < 25000 ? 6 : 0;
+    rawScore -= holderTop5Pct >= 70 ? 8 : 0;
+    rawScore -= isHoneypot === true ? 12 : 0;
+    rawScore -= ageMin > 0 && ageMin < 30 ? 4 : 0;
+  }
+
+  rawScore += clamp(num(memory.learned_bias), -12, 10);
+  rawScore = Math.max(0, Math.min(100, Math.round(rawScore)));
+
+  const confidenceMeta = buildConfidenceMeta(sourceChecks, behavior.penalty);
+  const recommendation = buildRecommendation(rawScore, ageMin, pair, {
+    isHoneypot,
+    buyTax,
+    sellTax,
+    transferTax,
+    holderTop5Pct
+  });
+
+  return {
+    honeypot: `${honeypotEmoji} ${honeypotLabel}`,
+    transparency: `${transparencyEmoji} ${transparencyLabel}`,
+    holders: `${holderEmoji} ${holderLabel}`,
+    liquidity: `${liquidity.emoji} ${liquidity.label}`,
+    score: rawScore,
+    recommendation,
+    buyTax,
+    sellTax,
+    transferTax,
+    holderDetail,
+    transparencyDetail,
+    honeypotDetail,
+    memoryBias: num(memory.learned_bias),
+    memoryNote: explainBias(memory),
+    modeTitle: modeTitle(mode),
+    confidence: confidenceMeta.confidence,
+    integrity: confidenceMeta.integrity,
+    sourceChecks: confidenceMeta.checksText,
+    flowBehavior: behavior.flowLabel,
+    spamSignal: behavior.spamLabel,
+    coordinationSignal: behavior.coordinationLabel,
+    behaviorDetail: behavior.detail
+  };
+}
+
+// ================= CARD BUILDERS =================
+function buildSourceLines(pair) {
+  const dex = makeDexUrl(pair.chainId, pair.pairAddress, pair.url);
+  const bird = makeBirdeyeUrl(pair.chainId, pair.baseAddress);
+  const gecko = makeGeckoUrl(pair.chainId, pair.pairAddress);
+
+  const lines = [];
+  if (dex) lines.push(`🔗 DexScreener: ${escapeHtml(dex)}`);
+  if (bird) lines.push(`🔗 Birdeye: ${escapeHtml(bird)}`);
+  if (gecko) lines.push(`🔗 GeckoTerminal: ${escapeHtml(gecko)}`);
+  return lines;
+}
+
+function clickableAddressLine(pair) {
+  const dex = makeDexUrl(pair.chainId, pair.pairAddress, pair.url);
+  const addrText = escapeHtml(shortAddr(pair.baseAddress || pair.pairAddress || "", 8));
+  if (!dex) return `📍 Address: ${addrText}`;
+  return `📍 Address: <a href="${dex}">${addrText}</a>`;
+}
+
+async function buildScanCard(pair, title = "🔎 Token Scan", userId = null) {
+  const ageLabel = ageFromMs(pair.pairCreatedAt);
+  const verdict = await buildRiskVerdict(pair, userId);
+
+  const lines = [
+    `🧠 <b>Gorktimus Intelligence Terminal</b>`,
+    ``,
+    `<b>${escapeHtml(title)}</b> | ${buildGeneratedStamp()}`,
+    ``,
+    `🪙 <b>Token:</b> ${escapeHtml(pair.baseSymbol || "Unknown")} ${
+      pair.baseName ? `(${escapeHtml(pair.baseName)})` : ""
+    }`,
+    `⛓️ <b>Chain:</b> ${escapeHtml(humanChain(pair.chainId))}`,
+    `⏱️ <b>Age:</b> ${escapeHtml(ageLabel)}`,
+    ``,
+    `🧠 <b>Risk Verdict</b>`,
+    `⚠️ <b>Honeypot Check:</b> ${escapeHtml(verdict.honeypot)}`,
+    `🔍 <b>Contract Transparency:</b> ${escapeHtml(verdict.transparency)}`,
+    `👥 <b>Holder Concentration:</b> ${escapeHtml(verdict.holders)}`,
+    `💧 <b>Liquidity Health:</b> ${escapeHtml(verdict.liquidity)}`,
+    ``,
+    `🧬 <b>Flow + Confidence</b>`,
+    `📊 <b>Safety Score:</b> ${escapeHtml(String(verdict.score))} / 100`,
+    `🛡 <b>Confidence:</b> ${escapeHtml(verdict.confidence)}`,
+    `🧾 <b>Data Integrity:</b> ${escapeHtml(verdict.integrity)}`,
+    `🔗 <b>Cross-Source Checks:</b> ${escapeHtml(verdict.sourceChecks)}`,
+    `🌊 <b>Flow Read:</b> ${escapeHtml(verdict.flowBehavior)}`,
+    `🛰 <b>Tx Spam Signal:</b> ${escapeHtml(verdict.spamSignal)}`,
+    `🎯 <b>Coordination Signal:</b> ${escapeHtml(verdict.coordinationSignal)}`,
+    verdict.behaviorDetail ? `🧠 <b>Behavior Note:</b> ${escapeHtml(verdict.behaviorDetail)}` : "",
+    ``,
+    verdict.buyTax !== null || verdict.sellTax !== null || verdict.transferTax !== null
+      ? `🧾 <b>Taxes:</b> Buy ${escapeHtml(
+          verdict.buyTax !== null ? `${verdict.buyTax}%` : "N/A"
+        )} | Sell ${escapeHtml(
+          verdict.sellTax !== null ? `${verdict.sellTax}%` : "N/A"
+        )} | Transfer ${escapeHtml(
+          verdict.transferTax !== null ? `${verdict.transferTax}%` : "N/A"
+        )}`
+      : "",
+    verdict.honeypotDetail ? `🧪 <b>Simulation:</b> ${escapeHtml(verdict.honeypotDetail)}` : "",
+    verdict.holderDetail ? `📦 <b>Holder Detail:</b> ${escapeHtml(verdict.holderDetail)}` : "",
+    verdict.transparencyDetail
+      ? `📜 <b>Code Detail:</b> ${escapeHtml(verdict.transparencyDetail)}`
+      : "",
+    ``,
+    `🧬 <b>Mode:</b> ${escapeHtml(verdict.modeTitle || "Balanced")}`,
+    `🧠 <b>Adaptive Memory:</b> ${escapeHtml(verdict.memoryNote || "Neutral")}`,
+    ``,
+    `📢 <b>Recommendation:</b> ${escapeHtml(verdict.recommendation)}`,
+    ``,
+    `📈 <b>Market Data</b>`,
+    `💲 <b>Price:</b> ${escapeHtml(shortUsd(pair.priceUsd))}`,
+    `💧 <b>Liquidity:</b> ${escapeHtml(shortUsd(pair.liquidityUsd))}`,
+    `📊 <b>Market Cap:</b> ${escapeHtml(shortUsd(pair.marketCap || pair.fdv))}`,
+    `📈 <b>Volume 24h:</b> ${escapeHtml(shortUsd(pair.volumeH24))}`,
+    `🟢 <b>Buys:</b> ${escapeHtml(String(pair.buysM5))}`,
+    `🔴 <b>Sells:</b> ${escapeHtml(String(pair.sellsM5))}`,
+    `🔄 <b>Transactions:</b> ${escapeHtml(String(pair.txnsM5))}`,
+    ``,
+    clickableAddressLine(pair),
+    ``,
+    `🔗 <b>Data Sources</b>`,
+    ...buildSourceLines(pair)
+  ].filter(Boolean);
 
   return lines.join("\n");
 }
 
-async function scanToken(query) {
-  const looksLikeAddress = /^[A-Za-z0-9]{20,}$/.test(query.trim());
-  const pairs = looksLikeAddress ? await fetchDexByTokenAddress(query.trim()) : await fetchDexSearch(query.trim());
-  const bestPair = pickBestPair(pairs);
-  return { bestPair, pairs };
+function buildLaunchVerdict(pair) {
+  const ageMin = ageMinutesFromMs(pair.pairCreatedAt);
+  if (!ageMin) return "🧠 Verdict: Data is still limited. Treat this launch carefully.";
+  if (ageMin < 5) return "🧠 Verdict: This token is extremely fresh. Conditions can shift fast.";
+  if (ageMin < 30) {
+    return "🧠 Verdict: Early activity is forming. Liquidity and order flow should still be treated carefully.";
+  }
+  if (ageMin < 180) {
+    return "🧠 Verdict: The launch has started to build a clearer profile, but it is still early.";
+  }
+  return "🧠 Verdict: This token has been trading long enough to show a more stable market profile than most fresh launches.";
 }
 
-async function upsertWatchlist(chatId, query, bestPair, riskScore) {
-  const existing = await get(
-    `SELECT * FROM watchlist WHERE chat_id = ? AND (contract_address = ? OR query = ?) AND active = 1 LIMIT 1`,
-    [String(chatId), bestPair?.baseToken?.address || "", query]
-  );
+async function buildLaunchCard(pair, rank = 0, userId = null) {
+  const title = rank > 0 ? `📡 Launch Radar #${rank}` : "📡 Launch Radar";
+  const verdict = await buildRiskVerdict(pair, userId);
 
-  const ts = nowTs();
-  if (existing) {
-    await run(
-      `UPDATE watchlist
-       SET query = ?, symbol = ?, contract_address = ?, chain_id = ?, pair_address = ?, last_price = ?, last_liquidity = ?, last_risk_score = ?, updated_at = ?
-       WHERE id = ?`,
-      [
-        query,
-        bestPair?.baseToken?.symbol || "",
-        bestPair?.baseToken?.address || "",
-        bestPair?.chainId || "",
-        bestPair?.pairAddress || "",
-        safeNum(bestPair?.priceUsd, 0),
-        safeNum(bestPair?.liquidity?.usd, 0),
-        riskScore,
-        ts,
-        existing.id
-      ]
-    );
-    return existing.id;
+  const lines = [
+    `🧠 <b>Gorktimus Intelligence Terminal</b>`,
+    ``,
+    `<b>${escapeHtml(title)}</b> | ${buildGeneratedStamp()}`,
+    ``,
+    `🪙 <b>Token:</b> ${escapeHtml(pair.baseSymbol || "Unknown")} ${
+      pair.baseName ? `(${escapeHtml(pair.baseName)})` : ""
+    }`,
+    `⛓️ <b>Chain:</b> ${escapeHtml(humanChain(pair.chainId))}`,
+    `⏱️ <b>Age:</b> ${escapeHtml(ageFromMs(pair.pairCreatedAt))}`,
+    ``,
+    `📡 <b>Launch Read</b>`,
+    `${escapeHtml(buildLaunchVerdict(pair))}`,
+    ``,
+    `📊 <b>Safety Score:</b> ${escapeHtml(String(verdict.score))} / 100`,
+    `🛡 <b>Confidence:</b> ${escapeHtml(verdict.confidence)}`,
+    `🧾 <b>Data Integrity:</b> ${escapeHtml(verdict.integrity)}`,
+    `🌊 <b>Flow Read:</b> ${escapeHtml(verdict.flowBehavior)}`,
+    `🛰 <b>Tx Spam Signal:</b> ${escapeHtml(verdict.spamSignal)}`,
+    `🎯 <b>Coordination Signal:</b> ${escapeHtml(verdict.coordinationSignal)}`,
+    ``,
+    `⚠️ <b>Honeypot Check:</b> ${escapeHtml(verdict.honeypot)}`,
+    `🔍 <b>Contract Transparency:</b> ${escapeHtml(verdict.transparency)}`,
+    `👥 <b>Holder Concentration:</b> ${escapeHtml(verdict.holders)}`,
+    `💧 <b>Liquidity Health:</b> ${escapeHtml(verdict.liquidity)}`,
+    ``,
+    `📢 <b>Recommendation:</b> ${escapeHtml(verdict.recommendation)}`,
+    ``,
+    `💲 <b>Price:</b> ${escapeHtml(shortUsd(pair.priceUsd))}`,
+    `💧 <b>Liquidity:</b> ${escapeHtml(shortUsd(pair.liquidityUsd))}`,
+    `📈 <b>Volume 24h:</b> ${escapeHtml(shortUsd(pair.volumeH24))}`,
+    clickableAddressLine(pair)
+  ].filter(Boolean);
+
+  return lines.join("\n");
+}
+
+function primePickScore(pair) {
+  const ageMin = ageMinutesFromMs(pair.pairCreatedAt);
+  const buySellRatio =
+    pair.sellsM5 > 0 ? pair.buysM5 / Math.max(pair.sellsM5, 1) : pair.buysM5;
+
+  return (
+    pair.liquidityUsd * 2.5 +
+    pair.volumeH24 * 1.8 +
+    pair.buysM5 * 300 +
+    Math.min(ageMin, 720) * 200 +
+    buySellRatio * 20000 -
+    pair.sellsM5 * 50
+  );
+}
+
+async function buildPrimePickCandidates(limit = 5) {
+  const profiles = await fetchLatestProfiles();
+  const boosts = await fetchLatestBoosts();
+  const merged = new Map();
+
+  for (const item of profiles) {
+    if (!item?.chainId || !item?.tokenAddress) continue;
+    if (!supportsChain(item.chainId)) continue;
+    merged.set(`${item.chainId}:${item.tokenAddress}`, {
+      chainId: String(item.chainId),
+      tokenAddress: String(item.tokenAddress)
+    });
   }
 
-  const result = await run(
-    `INSERT INTO watchlist
-     (chat_id, query, symbol, contract_address, chain_id, pair_address, last_price, last_liquidity, last_risk_score, active, created_at, updated_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)`,
-    [
-      String(chatId),
-      query,
-      bestPair?.baseToken?.symbol || "",
-      bestPair?.baseToken?.address || "",
-      bestPair?.chainId || "",
-      bestPair?.pairAddress || "",
-      safeNum(bestPair?.priceUsd, 0),
-      safeNum(bestPair?.liquidity?.usd, 0),
-      riskScore,
-      ts,
-      ts
-    ]
+  for (const item of boosts) {
+    if (!item?.chainId || !item?.tokenAddress) continue;
+    if (!supportsChain(item.chainId)) continue;
+    merged.set(`${item.chainId}:${item.tokenAddress}`, {
+      chainId: String(item.chainId),
+      tokenAddress: String(item.tokenAddress)
+    });
+  }
+
+  const out = [];
+
+  for (const item of [...merged.values()].slice(0, 40)) {
+    const pair = await resolveTokenToBestPair(item.chainId, item.tokenAddress);
+    if (!pair) continue;
+
+    const ageMin = ageMinutesFromMs(pair.pairCreatedAt);
+    if (pair.liquidityUsd < PRIME_MIN_LIQ_USD) continue;
+    if (pair.volumeH24 < PRIME_MIN_VOL_USD) continue;
+    if (ageMin < PRIME_MIN_AGE_MIN) continue;
+    if (pair.buysM5 < pair.sellsM5) continue;
+    if (!pair.priceUsd || !pair.marketCap) continue;
+
+    const verdict = await buildRiskVerdict(pair);
+    if (verdict.score < 52) continue;
+
+    pair._primeScore = primePickScore(pair) + verdict.score * 500;
+    out.push(pair);
+  }
+
+  return out.sort((a, b) => b._primeScore - a._primeScore).slice(0, limit);
+}
+
+async function showPrimePicks(chatId) {
+  const picks = await buildPrimePickCandidates(5);
+
+  if (!picks.length) {
+    await sendText(
+      chatId,
+      `🧠 <b>Gorktimus Intelligence Terminal</b>\n\n⭐ <b>Prime Picks</b>\n\nNo candidates cleared the current liquidity and market filters right now.`,
+      buildRefreshMainButtons("prime_picks")
+    );
+    return;
+  }
+
+  for (let i = 0; i < picks.length; i++) {
+    const pair = picks[i];
+    const imageUrl = await fetchTokenProfileImage(pair.chainId, pair.baseAddress, pair);
+
+    await sendCard(
+      chatId,
+      await buildScanCard(pair, `⭐ Prime Picks #${i + 1}`, chatId),
+      i === picks.length - 1 ? buildRefreshMainButtons("prime_picks") : {},
+      imageUrl
+    );
+
+    if (i < picks.length - 1) await sleep(250);
+  }
+}
+
+// ================= HELP SCREENS =================
+async function showSystemStatus(chatId) {
+  const walletCount = await get(
+    `SELECT COUNT(*) AS c FROM wallet_tracks WHERE chat_id = ? AND active = 1`,
+    [String(chatId)]
   );
-  return result.lastID;
+  const whaleCount = await get(
+    `SELECT COUNT(*) AS c FROM wallet_tracks WHERE chat_id = ? AND label_type = 'whale' AND active = 1`,
+    [String(chatId)]
+  );
+  const devCount = await get(
+    `SELECT COUNT(*) AS c FROM wallet_tracks WHERE chat_id = ? AND label_type = 'dev' AND active = 1`,
+    [String(chatId)]
+  );
+  const alertEnabledCount = await get(
+    `SELECT COUNT(*) AS c FROM wallet_tracks WHERE chat_id = ? AND active = 1 AND alerts_enabled = 1`,
+    [String(chatId)]
+  );
+
+  const botUserCount = await getBotUserCount();
+  const verifiedBotUsers = await getVerifiedSubscriberBotUsersCount();
+  const channelSubscribers = await getChannelSubscriberCount();
+
+  const lines = [
+    `🧠 <b>Gorktimus Intelligence Terminal</b>`,
+    ``,
+    `📊 <b>System Status</b>`,
+    ``,
+    `✅ Bot: Online`,
+    `✅ Database: Connected`,
+    `✅ Market Data: Active`,
+    `${hasHelius() ? "✅" : "⚠️"} Helius: ${hasHelius() ? "Connected" : "Missing"}`,
+    `${hasEtherscanKey() ? "✅" : "⚠️"} Etherscan: ${
+      hasEtherscanKey() ? "Connected" : "Missing"
+    }`,
+    `${fs.existsSync(TERMINAL_IMG) ? "✅" : "⚠️"} Terminal Image: ${
+      fs.existsSync(TERMINAL_IMG) ? "Loaded" : "Missing"
+    }`,
+    `📢 Required Channel: ${escapeHtml(REQUIRED_CHANNEL)}`,
+    `👥 Channel Subscribers: ${channelSubscribers === null ? "Unavailable" : channelSubscribers}`,
+    `🤖 Bot Users Saved: ${botUserCount}`,
+    `✅ Verified Subscriber Bot Users: ${verifiedBotUsers}`,
+    `🐋 Tracked Wallets: ${walletCount?.c || 0}`,
+    `🐋 Whale Wallets: ${whaleCount?.c || 0}`,
+    `👤 Dev Wallets: ${devCount?.c || 0}`,
+    `🔔 Alerted Wallets: ${alertEnabledCount?.c || 0}`,
+    `⏱️ Wallet Monitor: ${hasHelius() ? `${WALLET_SCAN_INTERVAL_MS / 1000}s` : "Unavailable"}`,
+    BOT_USERNAME ? `🤖 Bot Username: @${BOT_USERNAME}` : ""
+  ].filter(Boolean);
+
+  await sendText(chatId, lines.join("\n"), buildMainMenuOnlyButton());
 }
 
-async function removeWatchlist(chatId, watchId) {
-  await run(`UPDATE watchlist SET active = 0, updated_at = ? WHERE id = ? AND chat_id = ?`, [nowTs(), watchId, String(chatId)]);
+async function showHowToUse(chatId) {
+  const text = [
+    `🧠 <b>Gorktimus Intelligence Terminal</b>`,
+    ``,
+    `📖 <b>How To Use</b>`,
+    ``,
+    `🔎 <b>Scan Token</b>`,
+    `Send a ticker, token address, or pair search. Gorktimus will resolve the strongest pair it can find, score risk, and explain what the market structure looks like.`,
+    ``,
+    `📈 <b>Trending</b>`,
+    `This is not meant to copy Dex line-for-line. Trending is rebuilt from live candidate discovery and then filtered by liquidity, flow, and structural quality. Tap the token name to get the address, then use the quick buttons to scan, watch, or open Dex.`,
+    ``,
+    `📡 <b>Launch Radar</b>`,
+    `Shows fresher launches that still meet minimum live market conditions. This is for early discovery, not guaranteed safety.`,
+    ``,
+    `⭐ <b>Prime Picks</b>`,
+    `Shows stronger candidates that cleared tighter liquidity, volume, age, and risk filters.`,
+    ``,
+    `👁 <b>Watchlist</b>`,
+    `Save tokens, re-scan them quickly, and let the bot monitor for meaningful drift.`,
+    ``,
+    `🤖 <b>AI Assistant</b>`,
+    `Turn on assistant mode if you want to ask natural questions about scans, safety score, holder concentration, why a token differs from Dex, or what a live setup may be signaling.`,
+    ``,
+    `🧬 <b>Mode Lab</b>`,
+    `Aggressive = earlier entries and more tolerance for risk.
+Balanced = strongest default.
+Guardian = stricter defense and cleaner filtering.`
+  ].join("\n");
+
+  await sendText(chatId, text, buildMainMenuOnlyButton());
 }
 
+async function showDataSources(chatId) {
+  const text = [
+    `🧠 <b>Gorktimus Intelligence Terminal</b>`,
+    ``,
+    `⚙️ <b>Data Sources</b>`,
+    ``,
+    `Primary market discovery uses:`,
+    `• DexScreener`,
+    `• Birdeye links`,
+    `• GeckoTerminal links`,
+    ``,
+    `Additional risk and contract layers use:`,
+    `• Honeypot.is`,
+    `• Etherscan V2`,
+    `• Helius RPC for Solana holder concentration`,
+    ``,
+    `How to think about this:`,
+    `Dex is usually the discovery layer.`,
+    `Gorktimus is the intelligence layer.`,
+    ``,
+    `That means price, liquidity, and flow may begin from the live pair feed, but the terminal then adds contract, holder, behavior, memory, and mode-aware interpretation on top. That is why the output is designed to be smarter than a raw trending feed, not identical to one.`,
+    ``,
+    `Supported priority chains:`,
+    `• Solana`,
+    `• Base`,
+    `• Ethereum`
+  ].join("\n");
+
+  await sendText(chatId, text, buildMainMenuOnlyButton());
+}
+
+async function showCommunity(chatId) {
+  const text = [
+    `🧠 <b>Gorktimus Intelligence Terminal</b>`,
+    ``,
+    `💬 <b>Contact / Community</b>`,
+    ``,
+    `X: ${escapeHtml(COMMUNITY_X_URL)}`,
+    `Telegram: ${escapeHtml(COMMUNITY_TELEGRAM_URL)}`
+  ].join("\n");
+
+  await sendText(chatId, text, buildMainMenuOnlyButton());
+}
+
+async function showHowGorktimusWorks(chatId) {
+  const text = [
+    `🧠 <b>How Gorktimus Works</b>`,
+    ``,
+    `Gorktimus is built as a live crypto intelligence terminal, not a simple market mirror.`,
+    ``,
+    `The stack does three different jobs:`,
+    `• discovers active pairs`,
+    `• scores structural risk and opportunity`,
+    `• explains the result in plain language`,
+    ``,
+    `That means it is trying to answer a harder question than “what is moving?”`,
+    `It is trying to answer “what is moving, how clean is it, and what could be hiding underneath that movement?”`,
+    ``,
+    `So when you scan a token, you are not just getting price and liquidity. You are also getting holder concentration context, contract transparency clues, behavior signals, memory bias from prior outcomes, and mode-aware score shaping.`
+  ].join("\n");
+
+  await sendText(chatId, text, buildMainMenuOnlyButton());
+}
+
+async function showWhyDifferentFromDex(chatId) {
+  const text = [
+    `🧠 <b>Why Gorktimus Does Not Always Match Dex</b>`,
+    ``,
+    `Dex is a raw activity feed.`,
+    `Gorktimus is a filtered intelligence layer.`,
+    ``,
+    `Dex can surface tokens because they are simply loud:`,
+    `• volume spikes`,
+    `• transaction bursts`,
+    `• paid boosts`,
+    `• very early launches`,
+    ``,
+    `Gorktimus can deliberately rank those lower if the structure looks weak:`,
+    `• thin liquidity`,
+    `• suspicious holder concentration`,
+    `• dangerous tax / honeypot signals`,
+    `• poor contract transparency`,
+    `• one-sided or spammy transaction patterns`,
+    ``,
+    `So if a token is high on Dex but lower here, that usually means the terminal thinks the raw noise is stronger than the underlying structure.`
+  ].join("\n");
+
+  await sendText(chatId, text, buildMainMenuOnlyButton());
+}
+
+async function showTransactionsExplained(chatId) {
+  const text = [
+    `🧠 <b>Transactions / Flow Explained</b>`,
+    ``,
+    `When Gorktimus shows buys, sells, and transactions, it is reading recent live pair activity from the market feed and then interpreting it.`,
+    ``,
+    `Important: transaction count does <b>not</b> automatically mean real strength.`,
+    ``,
+    `High transactions can still be weak if:`,
+    `• average size is tiny`,
+    `• liquidity is thin`,
+    `• the buy pressure is too one-sided`,
+    `• the move looks manufactured`,
+    ``,
+    `That is why Gorktimus treats transactions as one part of the puzzle, not the whole puzzle. Flow is read together with liquidity, volume, holder concentration, taxes, contract transparency, and memory bias.`
+  ].join("\n");
+
+  await sendText(chatId, text, buildMainMenuOnlyButton());
+}
+
+async function showScoreExplained(chatId) {
+  const text = [
+    `🧠 <b>Safety Score + Confidence</b>`,
+    ``,
+    `The safety score is a live structured judgment, not a guarantee and not financial advice.`,
+    ``,
+    `The score weighs things like:`,
+    `• liquidity health`,
+    `• age / launch maturity`,
+    `• recent buy-vs-sell flow`,
+    `• volume quality`,
+    `• holder concentration`,
+    `• honeypot / tax clues`,
+    `• contract transparency`,
+    `• adaptive memory`,
+    `• current mode`,
+    ``,
+    `Confidence tells you how complete the supporting evidence is.`,
+    `Higher confidence usually means more source checks lined up cleanly. Lower confidence usually means the terminal had to work with partial or noisy data.`
+  ].join("\n");
+
+  await sendText(chatId, text, buildMainMenuOnlyButton());
+}
+
+
+async function showAIAssistantIntro(chatId) {
+  pendingAction.set(chatId, { type: "AI_ASSISTANT" });
+
+  const text = [
+    `🧠 <b>Gorktimus AI Assistant</b>`,
+    ``,
+    `Assistant mode is now <b>ON</b>.`,
+    ``,
+    `Ask natural questions like:`,
+    `• why did this token score low`,
+    `• what does holder concentration mean`,
+    `• why does trending not match Dex`,
+    `• explain transactions and flow`,
+    `• which mode should I use`,
+    `• scan BONK`,
+    `• scan 0x...`,
+    ``,
+    `Type <b>exit</b> or tap <b>Exit Assistant</b> when you want to leave assistant mode.`
+  ].join("\n");
+
+  await sendText(chatId, text, buildAIAssistantMenu());
+}
+
+function buildAssistantGenericReply() {
+  return [
+    `🧠 <b>Gorktimus AI Assistant</b>`,
+    ``,
+    `I can explain how the terminal works, why a score is high or low, what transactions or holder concentration mean, why results can differ from Dex, or I can scan a ticker / address for you right now.`,
+    ``,
+    `Try something like:`,
+    `• why did this score low`,
+    `• explain safety score`,
+    `• why not match Dex`,
+    `• what do transactions mean`,
+    `• aggressive vs guardian`,
+    `• BONK`,
+    `• 0x...`
+  ].join("\n");
+}
+
+async function sendAssistantPairReply(chatId, pair) {
+  const verdict = await buildRiskVerdict(pair, chatId);
+  const lines = [
+    `🧠 <b>Gorktimus AI Assistant</b>`,
+    ``,
+    `<b>${escapeHtml(pair.baseSymbol || "Unknown")}</b> on <b>${escapeHtml(humanChain(pair.chainId))}</b>`,
+    ``,
+    `Here is the plain-English read:`,
+    `• Safety score: <b>${escapeHtml(String(verdict.score))}/100</b>`,
+    `• Confidence: <b>${escapeHtml(verdict.confidence)}</b>`,
+    `• Liquidity health: <b>${escapeHtml(verdict.liquidity)}</b>`,
+    `• Holder structure: <b>${escapeHtml(verdict.holders)}</b>`,
+    `• Contract / transparency: <b>${escapeHtml(verdict.transparency)}</b>`,
+    `• Flow read: <b>${escapeHtml(verdict.flowBehavior)}</b>`,
+    `• Tx spam signal: <b>${escapeHtml(verdict.spamSignal)}</b>`,
+    `• Coordination signal: <b>${escapeHtml(verdict.coordinationSignal)}</b>`,
+    ``,
+    `Recommendation: ${escapeHtml(verdict.recommendation)}`,
+    ``,
+    `If you want the full card, tap <b>Scan Token</b> or just send another ticker/address while assistant mode is active.`
+  ].join("\n");
+
+  await sendText(chatId, lines, buildAIAssistantMenu());
+}
+
+async function handleAIAssistantQuery(chatId, text) {
+  const cleaned = String(text || "").trim();
+  const lower = cleaned.toLowerCase();
+
+  if (!cleaned) return;
+
+  if (/^(exit|quit|close|done|menu|main menu)$/i.test(cleaned)) {
+    pendingAction.delete(chatId);
+    await showMainMenu(chatId);
+    return;
+  }
+
+  if (
+    isAddressLike(cleaned) ||
+    (/^[A-Za-z0-9_.$-]{2,24}$/.test(cleaned) &&
+      !cleaned.startsWith("/") &&
+      !/(what|why|how|when|where|should|does|is|are|can|explain|tell)/i.test(cleaned))
+  ) {
+    const pair = await resolveBestPair(cleaned);
+    if (!pair) {
+      await sendText(
+        chatId,
+        `🧠 <b>Gorktimus AI Assistant</b>\n\nI could not resolve a strong live token match for <b>${escapeHtml(
+          cleaned
+        )}</b>. Try a ticker, token address, or pair address.`,
+        buildAIAssistantMenu()
+      );
+      return;
+    }
+
+    const imageUrl = await fetchTokenProfileImage(pair.chainId, pair.baseAddress, pair);
+    await sendCard(chatId, await buildScanCard(pair, "🤖 AI Assistant Scan", chatId), buildScanActionButtons(pair), imageUrl);
+    await sendAssistantPairReply(chatId, pair);
+    return;
+  }
+
+  if (/(how.*work|what is gorktimus|what does gorktimus do|how does this work|what is this system)/i.test(lower)) {
+    await showHowGorktimusWorks(chatId);
+    return;
+  }
+
+  if (/(dex|match dex|different from dex|why.*dex|raw feed|trending source)/i.test(lower)) {
+    await showWhyDifferentFromDex(chatId);
+    return;
+  }
+
+  if (/(transaction|tx|buys|sells|flow|volume|spam)/i.test(lower)) {
+    await showTransactionsExplained(chatId);
+    return;
+  }
+
+  if (/(score|confidence|integrity|safe|safety|holder concentration|honeypot|tax|transparency)/i.test(lower)) {
+    await showScoreExplained(chatId);
+    return;
+  }
+
+  if (/(mode|aggressive|balanced|guardian)/i.test(lower)) {
+    await sendText(
+      chatId,
+      [
+        `🧠 <b>Gorktimus AI Assistant</b>`,
+        ``,
+        `Mode guide:`,
+        `• <b>Aggressive</b> = earlier entries, more tolerance for fresh or hotter setups`,
+        `• <b>Balanced</b> = strongest default for most users`,
+        `• <b>Guardian</b> = stricter defense, better if you want cleaner structure and less tolerance for weak liquidity or concentration risk`
+      ].join("\n"),
+      buildAIAssistantMenu()
+    );
+    return;
+  }
+
+  if (/(what should i buy|best trade|what should i trade|good trade|should i ape)/i.test(lower)) {
+    await sendText(
+      chatId,
+      [
+        `🧠 <b>Gorktimus AI Assistant</b>`,
+        ``,
+        `I do not pick blind trades out of thin air. Send me a ticker or token address and I will break down the live structure, risk, confidence, and what the current setup appears to be doing.`
+      ].join("\n"),
+      buildAIAssistantMenu()
+    );
+    return;
+  }
+
+  await sendText(chatId, buildAssistantGenericReply(), buildAIAssistantMenu());
+}
+
+// ================= WHALE / DEV TRACKING =================
 async function addWalletTrack(chatId, wallet, labelType, nickname) {
   const ts = nowTs();
 
   if (!hasHelius()) {
-    await sendText(chatId, [
-      "<b>GorKtimus Intelligence Terminal</b>",
-      "",
-      "Helius is missing.",
-      "Add <code>HELIUS_API_KEY</code> to enable wallet tracking."
-    ].join("\n"), buildMainMenu());
+    await sendText(
+      chatId,
+      `🧠 <b>Gorktimus Intelligence Terminal</b>\n\n⚠️ Helius is missing. Add HELIUS_API_KEY to enable wallet tracking.`,
+      buildMainMenuOnlyButton()
+    );
     return;
   }
 
   if (!isLikelySolanaWallet(wallet)) {
-    await sendText(chatId, [
-      "<b>GorKtimus Intelligence Terminal</b>",
-      "",
-      "That does not look like a valid Solana wallet address."
-    ].join("\n"), buildMainMenu());
+    await sendText(
+      chatId,
+      `🧠 <b>Gorktimus Intelligence Terminal</b>\n\n❌ That does not look like a valid Solana wallet address.`,
+      buildMainMenuOnlyButton()
+    );
     return;
   }
 
-  await run(
-    `INSERT INTO wallet_tracks
-     (chat_id, wallet, label_type, nickname, chain_id, active, alerts_enabled, created_at, updated_at)
-     VALUES (?, ?, ?, ?, 'solana', 1, 1, ?, ?)`,
-    [String(chatId), wallet.trim(), labelType, nickname.trim(), ts, ts]
+  try {
+    await run(
+      `INSERT INTO wallet_tracks
+      (chat_id, wallet, label_type, nickname, chain_id, active, alerts_enabled, created_at, updated_at)
+      VALUES (?, ?, ?, ?, 'solana', 1, 1, ?, ?)`,
+      [String(chatId), wallet.trim(), labelType, nickname.trim(), ts, ts]
+    );
+
+    await sendText(
+      chatId,
+      `🧠 <b>Gorktimus Intelligence Terminal</b>\n\n${
+        labelType === "whale" ? "🐋" : "👤"
+      } ${escapeHtml(labelType === "whale" ? "Whale" : "Dev wallet")} added.\n\nName: ${escapeHtml(
+        nickname
+      )}\nWallet: ${escapeHtml(shortAddr(wallet, 8))}`,
+      buildMainMenuOnlyButton()
+    );
+  } catch (err) {
+    if (String(err.message).includes("UNIQUE")) {
+      await sendText(
+        chatId,
+        `🧠 <b>Gorktimus Intelligence Terminal</b>\n\n⚠️ That wallet is already tracked in this category.`,
+        buildMainMenuOnlyButton()
+      );
+      return;
+    }
+    throw err;
+  }
+}
+
+async function showWalletList(chatId, type) {
+  const rows = await all(
+    `SELECT id, wallet, nickname, alerts_enabled
+     FROM wallet_tracks
+     WHERE chat_id = ? AND label_type = ? AND active = 1
+     ORDER BY created_at DESC`,
+    [String(chatId), type]
   );
 
-  await sendText(chatId, [
-    "<b>Wallet Tracking Added</b>",
-    "",
-    `Wallet: <code>${escapeHtml(wallet.trim())}</code>`,
-    `Type: <b>${escapeHtml(labelType)}</b>`,
-    `Nickname: <b>${escapeHtml(nickname.trim())}</b>`
-  ].join("\n"), buildMainMenu());
-}
-
-async function fetchHeliusTransactions(wallet) {
-  if (!hasHelius()) return [];
-  const url = `https://api.helius.xyz/v0/addresses/${wallet}/transactions?api-key=${HELIUS_API_KEY}`;
-  const { data } = await axios.get(url, { timeout: 15000 });
-  return Array.isArray(data) ? data : [];
-}
-
-async function generateAssistantReply(chatId, prompt) {
-  const history = await getPromptHistory(chatId, 6);
-  const lower = prompt.toLowerCase();
-
-  if (lower.includes("what is liquidity")) {
-    return "Liquidity is the real exit fuel. A token can show hype and market cap, but if liquidity is thin, getting out clean gets hard fast.";
-  }
-
-  if (lower.includes("what does market cap mean")) {
-    return "Market cap is price multiplied by supply. It can look big on paper, but if liquidity is tiny, that market cap can be misleading in practice.";
-  }
-
-  if (lower.includes("why no data")) {
-    return "No data usually means the pair is too new, not indexed yet, the symbol was too broad, or the source does not expose enough live pair detail yet.";
-  }
-
-  if (lower.includes("help") || lower.includes("how does this work")) {
-    return "GorKtimus scans pair structure, liquidity, volume, pressure, and launch behavior to turn raw market data into a plain-language risk verdict.";
-  }
-
-  const memory = history.map((m) => `${m.role.toUpperCase()}: ${m.content}`).join(" | ");
-  return [
-    "GorKtimus AI Assistant",
-    "",
-    "I am running in local defense mode right now.",
-    "I can explain scans, market structure, liquidity, sell pressure, launch risk, and how to use the terminal.",
-    "",
-    `Your question: "${prompt.slice(0, 200)}"`,
-    "",
-    `Recent context: ${memory.slice(0, 500) || "No recent context yet."}`
-  ].join("\n");
-}
-
-async function sendWelcome(chatId, refCode = "") {
-  const intro = [
-    "<b>GorKtimus Intelligence Terminal</b>",
-    "",
-    "Built to protect users from weak structure, false confidence, and low-quality token flow.",
-    "",
-    "Choose how you want the terminal to think:",
-    "- <b>Mode A</b> - Fast Scan",
-    "- <b>Mode B</b> - Balanced Intelligence",
-    "- <b>Mode C</b> - Deep Defense",
-    "",
-    "Use the menu below to scan tokens, track watchlist names, monitor wallets, and understand what the data actually means."
-  ].join("\n");
-
-  await sendText(chatId, intro, buildMainMenu());
-  if (refCode) await registerReferral(chatId, refCode);
-}
-
-async function registerReferral(chatId, refCode) {
-  try {
-    const referrerId = String(refCode).replace(/^ref_/, "");
-    if (!referrerId || referrerId === String(chatId)) return;
-    const exists = await get(
-      `SELECT * FROM referrals WHERE referrer_chat_id = ? AND referred_chat_id = ?`,
-      [referrerId, String(chatId)]
+  if (!rows.length) {
+    await sendText(
+      chatId,
+      `🧠 <b>Gorktimus Intelligence Terminal</b>\n\n${
+        type === "whale" ? "🐋 <b>Whale List</b>" : "👤 <b>Dev List</b>"
+      }\n\nNo wallets saved yet.`,
+      buildMainMenuOnlyButton()
     );
-    if (exists) return;
-    await run(
-      `INSERT INTO referrals (referrer_chat_id, referred_chat_id, code, created_at)
-       VALUES (?, ?, ?, ?)`,
-      [referrerId, String(chatId), refCode, nowTs()]
-    );
-  } catch (err) {
-    console.error("registerReferral error:", err.message);
-  }
-}
-
-async function sendTrending(chatId) {
-  const raw = await fetchTrendingPairs();
-  const items = raw
-    .filter((x) => x?.tokenAddress || x?.url)
-    .slice(0, 10)
-    .map((x) => ({
-      pairAddress: x.tokenAddress || "",
-      baseToken: {
-        symbol: x.tokenSymbol || "TOKEN",
-        name: x.tokenName || "Unknown",
-        address: x.tokenAddress || ""
-      },
-      liquidity: { usd: safeNum(x.liquidity, 0) },
-      volume: { h24: safeNum(x.volume24h, 0) },
-      chainId: x.chainId || "solana"
-    }));
-
-  if (!items.length) {
-    await sendText(chatId, "No trending data is available right now. Try again shortly.", buildMainMenu());
     return;
   }
 
-  const lines = ["<b>Trending Snapshot</b>", ""];
-  items.forEach((item, i) => {
-    lines.push(`${i + 1}. <b>${escapeHtml(item.baseToken.symbol)}</b> - ${fmtUsd(item.liquidity.usd)} liquidity`);
+  const lines = rows.map((row, i) => {
+    const status = row.alerts_enabled ? "ON" : "OFF";
+    return `${i + 1}. ${escapeHtml(row.nickname || shortAddr(row.wallet, 6))} | Alerts: ${status}`;
   });
 
-  await sendText(chatId, lines.join("\n"), buildTrendingMenu(items));
+  await sendText(
+    chatId,
+    `🧠 <b>Gorktimus Intelligence Terminal</b>\n\n${
+      type === "whale" ? "🐋 <b>Whale List</b>" : "👤 <b>Dev List</b>"
+    }\n\n${lines.join("\n")}`,
+    buildWalletListMenu(rows, type)
+  );
 }
 
-async function sendWatchlist(chatId) {
-  const rows = await all(`SELECT * FROM watchlist WHERE chat_id = ? AND active = 1 ORDER BY updated_at DESC LIMIT 10`, [String(chatId)]);
+async function showWalletAlertSettings(chatId) {
+  const rows = await all(
+    `SELECT id, nickname, wallet, label_type, alerts_enabled
+     FROM wallet_tracks
+     WHERE chat_id = ? AND active = 1
+     ORDER BY label_type ASC, created_at DESC`,
+    [String(chatId)]
+  );
+
   if (!rows.length) {
-    await sendText(chatId, [
-      "<b>Your Watchlist</b>",
-      "",
-      "No active watchlist entries yet.",
-      "Use <b>Scan Token</b>, then add the result to your watchlist."
-    ].join("\n"), buildMainMenu());
-    return;
-  }
-
-  const lines = ["<b>Your Watchlist</b>", ""];
-  for (const row of rows) {
-    lines.push(
-      `- <b>${escapeHtml(row.symbol || row.query)}</b> | Risk ${safeNum(row.last_risk_score, 0).toFixed(0)}/99 | Price ${fmtUsd(row.last_price)}`
+    await sendText(
+      chatId,
+      `🧠 <b>Gorktimus Intelligence Terminal</b>\n\n⚙️ <b>Alert Settings</b>\n\nNo tracked wallets found yet.`,
+      buildMainMenuOnlyButton()
     );
-  }
-
-  await sendText(chatId, lines.join("\n"), buildWatchlistMenu(rows));
-}
-
-async function sendReferrals(chatId) {
-  const count = await get(`SELECT COUNT(*) as total FROM referrals WHERE referrer_chat_id = ?`, [String(chatId)]);
-  const code = `ref_${chatId}`;
-  const botName = await bot.getMe();
-  const link = `https://t.me/${botName.username}?start=${code}`;
-
-  await sendText(chatId, [
-    "<b>Referral Hub</b>",
-    "",
-    `Your referrals: <b>${fmtInt(count?.total || 0)}</b>`,
-    `Invite Link: <code>${escapeHtml(link)}</code>`,
-    "",
-    "Share your link. New users are tracked when they launch the bot through your code."
-  ].join("\n"), buildMainMenu());
-}
-
-async function sendHelp(chatId) {
-  await sendText(chatId, [
-    "<b>How GorKtimus Works</b>",
-    "",
-    "- <b>Risk Verdict</b> turns raw market structure into plain-language guidance.",
-    "- <b>Liquidity</b> shows how real the exit path looks.",
-    "- <b>Volume</b> shows activity, but activity alone does not equal safety.",
-    "- <b>Trending</b> is a discovery layer, not a trust badge.",
-    "- <b>No data</b> can mean a pair is too new, too obscure, or not fully indexed yet.",
-    "- <b>Mode A/B/C</b> changes how much detail the terminal gives back.",
-    "",
-    "Ask AI Assistant things like:",
-    "- what does liquidity mean",
-    "- why is this token risky",
-    "- explain buy vs sell pressure"
-  ].join("\n"), buildMainMenu());
-}
-
-async function sendSettings(chatId) {
-  const user = await getUser(chatId);
-  await sendText(chatId, [
-    "<b>Mode Selector</b>",
-    "",
-    "Mode A - Fast Scan",
-    "Mode B - Balanced Intelligence",
-    "Mode C - Deep Defense",
-    "",
-    `Current Mode: <b>${escapeHtml(user?.mode || "balanced")}</b>`
-  ].join("\n"), buildModeButtons(user?.mode || "balanced"));
-}
-
-async function sendAlerts(chatId) {
-  const settings = await getSettings(chatId);
-  await sendText(chatId, [
-    "<b>Alerts Control Center</b>",
-    "",
-    `Price Threshold: <b>${fmtPct(settings?.price_alert_pct)}</b>`,
-    `Liquidity Threshold: <b>${fmtPct(settings?.liq_alert_pct)}</b>`,
-    `Cooldown: <b>${fmtInt(settings?.cooldown_seconds || ALERT_COOLDOWN_SECONDS)} sec</b>`,
-    "",
-    "Toggle what you want active below."
-  ].join("\n"), buildAlertsMenu(settings));
-}
-
-async function runScanAndRespond(chatId, query, addToWatchlist = false) {
-  const user = await getUser(chatId);
-  const { bestPair } = await scanToken(query);
-
-  if (!bestPair) {
-    await sendText(chatId, [
-      "<b>No Pair Found</b>",
-      "",
-      "I could not find a usable pair from that query.",
-      "Try a ticker, contract address, or more precise token name."
-    ].join("\n"), buildMainMenu());
     return;
   }
 
-  const card = buildScanCard(bestPair, user?.mode || "balanced");
-  const score = scorePair(bestPair);
+  const lines = rows.map((row, i) => {
+    const kind = row.label_type === "whale" ? "🐋" : "👤";
+    const status = row.alerts_enabled ? "ON" : "OFF";
+    return `${i + 1}. ${kind} ${escapeHtml(
+      row.nickname || shortAddr(row.wallet, 6)
+    )} | Alerts: ${status}`;
+  });
 
-  const buttons = {
-    reply_markup: {
-      inline_keyboard: [
-        [
-          { text: "Add to Watchlist", callback_data: `add_watch:${encodeURIComponent(query)}` },
-          { text: "Rescan", callback_data: `rescan:${encodeURIComponent(query)}` }
-        ],
-        buildBackMenuRow()
-      ]
-    },
-    parse_mode: "HTML",
-    disable_web_page_preview: true
+  await sendText(
+    chatId,
+    `🧠 <b>Gorktimus Intelligence Terminal</b>\n\n⚙️ <b>Alert Settings</b>\n\n${lines.join("\n")}`,
+    buildMainMenuOnlyButton()
+  );
+}
+
+async function showWalletItem(chatId, id) {
+  const row = await get(`SELECT * FROM wallet_tracks WHERE id = ? AND chat_id = ?`, [
+    id,
+    String(chatId)
+  ]);
+
+  if (!row) {
+    await sendText(
+      chatId,
+      `🧠 <b>Gorktimus Intelligence Terminal</b>\n\nWallet item not found.`,
+      buildMainMenuOnlyButton()
+    );
+    return;
+  }
+
+  const kind = row.label_type === "whale" ? "🐋 Whale" : "👤 Dev Wallet";
+  const status = row.alerts_enabled ? "ON" : "OFF";
+  const text = [
+    `🧠 <b>Gorktimus Intelligence Terminal</b>`,
+    ``,
+    `<b>${kind}</b>`,
+    ``,
+    `Name: ${escapeHtml(row.nickname || "Unnamed")}`,
+    `Wallet: ${escapeHtml(shortAddr(row.wallet, 8))}`,
+    `Alerts: ${status}`,
+    `Type: ${escapeHtml(row.label_type)}`,
+    `Chain: ${escapeHtml(humanChain(row.chain_id))}`
+  ].join("\n");
+
+  await sendText(chatId, text, buildWalletItemMenu(row));
+}
+
+async function toggleWalletAlerts(chatId, id) {
+  const row = await get(`SELECT * FROM wallet_tracks WHERE id = ? AND chat_id = ?`, [
+    id,
+    String(chatId)
+  ]);
+  if (!row) return;
+
+  const next = row.alerts_enabled ? 0 : 1;
+  await run(`UPDATE wallet_tracks SET alerts_enabled = ?, updated_at = ? WHERE id = ?`, [
+    next,
+    nowTs(),
+    id
+  ]);
+  await showWalletItem(chatId, id);
+}
+
+async function renameWallet(chatId, id, name) {
+  await run(`UPDATE wallet_tracks SET nickname = ?, updated_at = ? WHERE id = ? AND chat_id = ?`, [
+    name.trim(),
+    nowTs(),
+    id,
+    String(chatId)
+  ]);
+  await showWalletItem(chatId, id);
+}
+
+async function removeWallet(chatId, id) {
+  await run(`UPDATE wallet_tracks SET active = 0, updated_at = ? WHERE id = ? AND chat_id = ?`, [
+    nowTs(),
+    id,
+    String(chatId)
+  ]);
+  await sendText(
+    chatId,
+    `🧠 <b>Gorktimus Intelligence Terminal</b>\n\n✅ Wallet removed.`,
+    buildMainMenuOnlyButton()
+  );
+}
+
+async function fetchHeliusLatestTx(address) {
+  if (!HELIUS_API_KEY) return null;
+
+  try {
+    const res = await axios.get(
+      `https://api-mainnet.helius-rpc.com/v0/addresses/${encodeURIComponent(
+        address
+      )}/transactions?api-key=${encodeURIComponent(HELIUS_API_KEY)}`,
+      { timeout: HELIUS_TIMEOUT_MS }
+    );
+    const rows = Array.isArray(res.data) ? res.data : [];
+    return rows[0] || null;
+  } catch (err) {
+    console.log("fetchHeliusLatestTx error:", err.message);
+    return null;
+  }
+}
+
+function summarizeWalletTx(tx) {
+  if (!tx) {
+    return {
+      type: "Unknown",
+      source: "Unknown",
+      tokenLine: "Details: limited transaction data available",
+      amountLine: "",
+      signature: ""
+    };
+  }
+
+  const type = String(tx.type || "Unknown");
+  const source = String(tx.source || "Unknown");
+  const signature = String(tx.signature || "");
+
+  if (tx.events?.swap) {
+    const swap = tx.events.swap;
+    const tokenIn = swap.tokenInputs?.[0];
+    const tokenOut = swap.tokenOutputs?.[0];
+    const inSym = tokenIn?.symbol || shortAddr(tokenIn?.mint || "", 4) || "Unknown";
+    const outSym = tokenOut?.symbol || shortAddr(tokenOut?.mint || "", 4) || "Unknown";
+    const inAmt = num(tokenIn?.tokenAmount);
+    const outAmt = num(tokenOut?.tokenAmount);
+
+    return {
+      type,
+      source,
+      tokenLine: `Swap: ${inSym} → ${outSym}`,
+      amountLine: `Amount: ${inAmt || 0} → ${outAmt || 0}`,
+      signature
+    };
+  }
+
+  if (Array.isArray(tx.tokenTransfers) && tx.tokenTransfers.length) {
+    const first = tx.tokenTransfers[0];
+    const token = first?.symbol || shortAddr(first?.mint || "", 4) || "Unknown";
+    const amount = num(first?.tokenAmount);
+    return {
+      type,
+      source,
+      tokenLine: `Token: ${token}`,
+      amountLine: `Amount: ${amount || 0}`,
+      signature
+    };
+  }
+
+  return {
+    type,
+    source,
+    tokenLine: `Details: ${clip(tx.description || "limited transaction data available", 80)}`,
+    amountLine: "",
+    signature
   };
-
-  await sendText(chatId, card, buttons);
-
-  if (addToWatchlist) {
-    await upsertWatchlist(chatId, query, bestPair, score.score);
-  }
 }
 
-async function handleFreeText(msg) {
-  const chatId = msg.chat.id;
-  const text = normalizeText(msg.text || "");
-  const user = await getUser(chatId);
+async function sendWalletMovementAlert(row, tx) {
+  const info = summarizeWalletTx(tx);
+  const kindEmoji = row.label_type === "whale" ? "🐋" : "👤";
+  const kindText =
+    row.label_type === "whale" ? "Whale Movement Detected" : "Dev Wallet Movement Detected";
 
-  if (!text) return;
-  if (!(await enforceMembership(chatId))) return;
+  const lines = [
+    `🧠 <b>Gorktimus Intelligence Terminal</b>`,
+    ``,
+    `${kindEmoji} <b>${kindText}</b>`,
+    ``,
+    `Name: ${escapeHtml(row.nickname || shortAddr(row.wallet, 8))}`,
+    `Wallet: ${escapeHtml(shortAddr(row.wallet, 8))}`,
+    `Type: ${escapeHtml(info.type)}`,
+    `Source: ${escapeHtml(info.source)}`,
+    escapeHtml(info.tokenLine),
+    info.amountLine ? escapeHtml(info.amountLine) : "",
+    info.signature ? `Signature: ${escapeHtml(shortAddr(info.signature, 8))}` : "",
+    `Detected: just now`
+  ].filter(Boolean);
 
-  if (user?.expecting_input === "scan_query") {
-    await setExpecting(chatId, null);
-    await runScanAndRespond(chatId, text, false);
-    return;
-  }
-
-  if (user?.expecting_input === "wallet_add") {
-    await setExpecting(chatId, null);
-    const parts = text.split("|").map((x) => x.trim());
-    const wallet = parts[0] || "";
-    const labelType = (parts[1] || "whale").toLowerCase();
-    const nickname = parts[2] || `Tracked ${labelType}`;
-    await addWalletTrack(chatId, wallet, labelType, nickname);
-    return;
-  }
-
-  if (user?.expecting_input === "ai_prompt") {
-    await setExpecting(chatId, null);
-    await logPrompt(chatId, "user", text);
-    const reply = await generateAssistantReply(chatId, text);
-    await logPrompt(chatId, "assistant", reply);
-    await sendText(chatId, escapeHtml(reply), buildMainMenu());
-    return;
-  }
-
-  if (text.startsWith("/scan ")) {
-    await runScanAndRespond(chatId, text.replace("/scan ", "").trim(), false);
-    return;
-  }
-
-  if (text.startsWith("/ai ")) {
-    const prompt = text.replace("/ai ", "").trim();
-    await logPrompt(chatId, "user", prompt);
-    const reply = await generateAssistantReply(chatId, prompt);
-    await logPrompt(chatId, "assistant", reply);
-    await sendText(chatId, escapeHtml(reply), buildMainMenu());
-    return;
-  }
-
-  await sendText(chatId, [
-    "<b>GorKtimus Terminal</b>",
-    "",
-    "I did not route that input to a specific flow.",
-    "Use the menu or commands:",
-    "<code>/scan token_or_contract</code>",
-    "<code>/ai ask_question_here</code>"
-  ].join("\n"), buildMainMenu());
+  await sendText(row.chat_id, lines.join("\n"), buildMainMenuOnlyButton());
 }
 
-async function monitorWatchlistLoop() {
-  while (true) {
-    try {
-      const rows = await all(`SELECT * FROM watchlist WHERE active = 1 ORDER BY id ASC LIMIT 50`);
-      for (const row of rows) {
-        const settings = await getSettings(row.chat_id);
-        const user = await getUser(row.chat_id);
-        if (!user || !settings) continue;
+async function checkWalletNow(chatId, id) {
+  const row = await get(`SELECT * FROM wallet_tracks WHERE id = ? AND chat_id = ?`, [
+    id,
+    String(chatId)
+  ]);
+  if (!row) return;
 
-        const query = row.contract_address || row.query;
-        const { bestPair } = await scanToken(query);
-        if (!bestPair) continue;
+  const tx = await fetchHeliusLatestTx(row.wallet);
+  if (!tx) {
+    await sendText(
+      chatId,
+      `🧠 <b>Gorktimus Intelligence Terminal</b>\n\n🔍 No recent transaction data was found for this wallet.`,
+      buildMainMenuOnlyButton()
+    );
+    return;
+  }
 
-        const newPrice = safeNum(bestPair.priceUsd, 0);
-        const newLiquidity = safeNum(bestPair?.liquidity?.usd, 0);
-        const priceDelta = Math.abs(pctChange(row.last_price, newPrice));
-        const liqDelta = Math.abs(pctChange(row.last_liquidity, newLiquidity));
-        const risk = scorePair(bestPair);
+  const info = summarizeWalletTx(tx);
+  const kindEmoji = row.label_type === "whale" ? "🐋" : "👤";
+  const text = [
+    `🧠 <b>Gorktimus Intelligence Terminal</b>`,
+    ``,
+    `${kindEmoji} <b>Wallet Check</b>`,
+    ``,
+    `Name: ${escapeHtml(row.nickname || shortAddr(row.wallet, 8))}`,
+    `Wallet: ${escapeHtml(shortAddr(row.wallet, 8))}`,
+    `Type: ${escapeHtml(info.type)}`,
+    `Source: ${escapeHtml(info.source)}`,
+    escapeHtml(info.tokenLine),
+    info.amountLine ? escapeHtml(info.amountLine) : "",
+    info.signature ? `Signature: ${escapeHtml(shortAddr(info.signature, 8))}` : ""
+  ]
+    .filter(Boolean)
+    .join("\n");
 
-        const shouldPrice = settings.price_alerts && priceDelta >= safeNum(settings.price_alert_pct, DEFAULT_ALERT_PCT);
-        const shouldLiq = settings.liq_alerts && liqDelta >= safeNum(settings.liq_alert_pct, DEFAULT_LIQ_ALERT_PCT);
-        const shouldRisk = settings.risk_alerts && Math.abs(risk.score - safeNum(row.last_risk_score, risk.score)) >= 12;
+  await sendText(chatId, text, buildMainMenuOnlyButton());
+}
 
-        if (shouldPrice || shouldLiq || shouldRisk) {
-          const reasons = [];
-          if (shouldPrice) reasons.push(`price moved ${fmtPct(priceDelta)}`);
-          if (shouldLiq) reasons.push(`liquidity moved ${fmtPct(liqDelta)}`);
-          if (shouldRisk) reasons.push(`risk score shifted to ${risk.score}/99`);
+async function checkWalletByAddress(chatId, wallet) {
+  if (!hasHelius()) {
+    await sendText(
+      chatId,
+      `🧠 <b>Gorktimus Intelligence Terminal</b>\n\n⚠️ Helius is missing. Add HELIUS_API_KEY to enable wallet checks.`,
+      buildMainMenuOnlyButton()
+    );
+    return;
+  }
 
-          await sendText(row.chat_id, [
-            "<b>Watchlist Alert</b>",
-            "",
-            `<b>${escapeHtml(bestPair?.baseToken?.symbol || row.query)}</b> triggered an alert.`,
-            `Reason: ${escapeHtml(reasons.join(", "))}`,
-            "",
-            buildScanCard(bestPair, user.mode || "balanced")
-          ].join("\n"), buildMainMenu());
-        }
+  if (!isLikelySolanaWallet(wallet)) {
+    await sendText(
+      chatId,
+      `🧠 <b>Gorktimus Intelligence Terminal</b>\n\n❌ That does not look like a valid Solana wallet address.`,
+      buildMainMenuOnlyButton()
+    );
+    return;
+  }
+
+  const tx = await fetchHeliusLatestTx(wallet.trim());
+  if (!tx) {
+    await sendText(
+      chatId,
+      `🧠 <b>Gorktimus Intelligence Terminal</b>\n\n🔍 No recent transaction data was found for that wallet.`,
+      buildMainMenuOnlyButton()
+    );
+    return;
+  }
+
+  const info = summarizeWalletTx(tx);
+  const text = [
+    `🧠 <b>Gorktimus Intelligence Terminal</b>`,
+    ``,
+    `🔍 <b>Wallet Check</b>`,
+    ``,
+    `Wallet: ${escapeHtml(shortAddr(wallet, 8))}`,
+    `Type: ${escapeHtml(info.type)}`,
+    `Source: ${escapeHtml(info.source)}`,
+    escapeHtml(info.tokenLine),
+    info.amountLine ? escapeHtml(info.amountLine) : "",
+    info.signature ? `Signature: ${escapeHtml(shortAddr(info.signature, 8))}` : ""
+  ]
+    .filter(Boolean)
+    .join("\n");
+
+  await sendText(chatId, text, buildMainMenuOnlyButton());
+}
+
+async function scanWalletTracks() {
+  if (!hasHelius() || walletScanRunning) return;
+  walletScanRunning = true;
+
+  try {
+    const rows = await all(
+      `SELECT * FROM wallet_tracks WHERE active = 1 AND alerts_enabled = 1 ORDER BY created_at ASC`
+    );
+
+    for (const row of rows) {
+      const tx = await fetchHeliusLatestTx(row.wallet);
+      if (!tx || !tx.signature) continue;
+
+      if (!row.last_signature) {
+        await run(
+          `UPDATE wallet_tracks SET last_signature = ?, last_seen_at = ?, updated_at = ? WHERE id = ?`,
+          [tx.signature, nowTs(), nowTs(), row.id]
+        );
+        continue;
+      }
+
+      if (tx.signature !== row.last_signature) {
+        await sendWalletMovementAlert(row, tx);
 
         await run(
-          `UPDATE watchlist
-           SET symbol = ?, contract_address = ?, pair_address = ?, chain_id = ?, last_price = ?, last_liquidity = ?, last_risk_score = ?, updated_at = ?
-           WHERE id = ?`,
-          [
-            bestPair?.baseToken?.symbol || row.symbol,
-            bestPair?.baseToken?.address || row.contract_address,
-            bestPair?.pairAddress || row.pair_address,
-            bestPair?.chainId || row.chain_id,
-            newPrice,
-            newLiquidity,
-            risk.score,
-            nowTs(),
-            row.id
-          ]
+          `UPDATE wallet_tracks SET last_signature = ?, last_seen_at = ?, updated_at = ? WHERE id = ?`,
+          [tx.signature, nowTs(), nowTs(), row.id]
         );
-
-        await sleep(350);
       }
-    } catch (err) {
-      console.error("monitorWatchlistLoop error:", err.message);
     }
-    await sleep(60000);
+  } catch (err) {
+    console.log("scanWalletTracks error:", err.message);
+  } finally {
+    walletScanRunning = false;
   }
 }
 
-async function monitorWalletLoop() {
-  while (true) {
+// ================= PENDING ACTIONS =================
+async function handlePendingAction(chatId, text) {
+  const pending = pendingAction.get(chatId);
+  if (!pending) return false;
+
+  const input = String(text || "").trim();
+  if (!input) return true;
+
+  try {
+    if (pending.type === "SCAN_TOKEN") {
+      pendingAction.delete(chatId);
+      await runTokenScan(chatId, input);
+      return true;
+    }
+
+    if (pending.type === "ADD_WHALE_WALLET") {
+      if (!isLikelySolanaWallet(input)) {
+        await sendText(
+          chatId,
+          `🧠 <b>Gorktimus Intelligence Terminal</b>\n\n❌ Please send a valid Solana wallet address.`,
+          buildMainMenuOnlyButton()
+        );
+        return true;
+      }
+      pendingAction.set(chatId, {
+        type: "ADD_WHALE_NAME",
+        wallet: input
+      });
+      await sendText(
+        chatId,
+        `🧠 <b>Gorktimus Intelligence Terminal</b>\n\n🐋 Now send a name for this whale wallet.`,
+        buildMainMenuOnlyButton()
+      );
+      return true;
+    }
+
+    if (pending.type === "ADD_WHALE_NAME") {
+      pendingAction.delete(chatId);
+      await addWalletTrack(chatId, pending.wallet, "whale", input);
+      return true;
+    }
+
+    if (pending.type === "ADD_DEV_WALLET") {
+      if (!isLikelySolanaWallet(input)) {
+        await sendText(
+          chatId,
+          `🧠 <b>Gorktimus Intelligence Terminal</b>\n\n❌ Please send a valid Solana wallet address.`,
+          buildMainMenuOnlyButton()
+        );
+        return true;
+      }
+      pendingAction.set(chatId, {
+        type: "ADD_DEV_NAME",
+        wallet: input
+      });
+      await sendText(
+        chatId,
+        `🧠 <b>Gorktimus Intelligence Terminal</b>\n\n👤 Now send a name for this dev wallet.`,
+        buildMainMenuOnlyButton()
+      );
+      return true;
+    }
+
+    if (pending.type === "ADD_DEV_NAME") {
+      pendingAction.delete(chatId);
+      await addWalletTrack(chatId, pending.wallet, "dev", input);
+      return true;
+    }
+
+    if (pending.type === "CHECK_WALLET") {
+      pendingAction.delete(chatId);
+      await checkWalletByAddress(chatId, input);
+      return true;
+    }
+
+    if (pending.type === "RENAME_WALLET") {
+      pendingAction.delete(chatId);
+      await renameWallet(chatId, pending.id, input);
+      return true;
+    }
+
+    if (pending.type === "AI_ASSISTANT") {
+      await handleAIAssistantQuery(chatId, input);
+      return true;
+    }
+  } catch (err) {
+    pendingAction.delete(chatId);
+    console.log("handlePendingAction error:", err.message);
+    await sendText(
+      chatId,
+      `🧠 <b>Gorktimus Intelligence Terminal</b>\n\n❌ Something went wrong while processing that request.`,
+      buildMainMenuOnlyButton()
+    );
+    return true;
+  }
+
+  return false;
+}
+
+async function scanWatchlistAlerts() {
+  const rows = await all(`SELECT * FROM watchlist WHERE active = 1 AND alerts_enabled = 1`, []);
+  if (!rows.length) return;
+
+  for (const row of rows) {
     try {
-      const rows = await all(`SELECT * FROM wallet_tracks WHERE active = 1 AND alerts_enabled = 1 ORDER BY id ASC LIMIT 25`);
-      for (const row of rows) {
-        if (!hasHelius()) break;
-        try {
-          const txs = await fetchHeliusTransactions(row.wallet);
-          if (!txs.length) continue;
-          const newest = txs[0];
-          const sig = newest?.signature || newest?.transactions?.[0]?.signature || "";
-          if (sig && sig !== row.last_seen_signature) {
-            await sendText(row.chat_id, [
-              "<b>Wallet Activity Detected</b>",
-              "",
-              `Nickname: <b>${escapeHtml(row.nickname)}</b>`,
-              `Type: <b>${escapeHtml(row.label_type)}</b>`,
-              `Wallet: <code>${escapeHtml(shortAddr(row.wallet, 8, 6))}</code>`,
-              `Latest Signature: <code>${escapeHtml(shortAddr(sig, 10, 8))}</code>`
-            ].join("\n"), buildMainMenu());
+      const settings = await getUserSettings(row.chat_id);
+      if (!num(settings.alerts_enabled)) continue;
 
-            await run(`UPDATE wallet_tracks SET last_seen_signature = ?, updated_at = ? WHERE id = ?`, [sig, nowTs(), row.id]);
-          }
-        } catch (err) {
-          console.error("wallet row error:", err.message);
-        }
-        await sleep(350);
+      const pair = await resolveExactPairOrToken(row.chain_id, row.token_address);
+      if (!pair) continue;
+
+      const verdict = await buildRiskVerdict(pair, row.chat_id);
+      await savePairMemorySnapshot(pair, verdict.score);
+
+      const oldPrice = num(row.last_price);
+      const oldLiq = num(row.last_liquidity);
+      const oldScore = num(row.last_score);
+      const newPrice = num(pair.priceUsd);
+      const newLiq = num(pair.liquidityUsd);
+      const priceDelta = oldPrice > 0 ? ((newPrice - oldPrice) / oldPrice) * 100 : 0;
+      const liqDelta = oldLiq > 0 ? ((newLiq - oldLiq) / oldLiq) * 100 : 0;
+      const scoreDelta = verdict.score - oldScore;
+      const since = nowTs() - num(row.last_alert_ts);
+
+      let shouldAlert = false;
+      let reason = "";
+
+      if (num(settings.smart_alerts) && priceDelta >= 12 && verdict.score >= 60) {
+        shouldAlert = true;
+        reason = `Momentum burst: ${toPct(priceDelta)}`;
+      } else if (num(settings.launch_alerts) && ageMinutesFromMs(pair.pairCreatedAt) <= 45 && verdict.score >= 58) {
+        shouldAlert = since >= WATCHLIST_ALERT_COOLDOWN_SEC;
+        reason = `Fresh launch watchlist token is active`;
+      } else if (num(settings.risk_alerts) && (scoreDelta <= -12 || liqDelta <= -18 || verdict.score <= 40)) {
+        shouldAlert = true;
+        reason = `Risk deterioration detected`;
       }
+
+      if (shouldAlert && since >= WATCHLIST_ALERT_COOLDOWN_SEC) {
+        const text = [
+          `🧠 <b>Gorktimus Watchlist Alert</b>`,
+          ``,
+          `🪙 <b>${escapeHtml(pair.baseSymbol || pair.baseName || 'Unknown')}</b>`,
+          `⛓️ ${escapeHtml(humanChain(pair.chainId))}`,
+          `📢 ${escapeHtml(reason)}`,
+          `📊 Score: <b>${verdict.score}/100</b>`,
+          `💲 Price: ${escapeHtml(shortUsd(pair.priceUsd))}`,
+          `💧 Liquidity: ${escapeHtml(shortUsd(pair.liquidityUsd))}`,
+          `📈 Volume 24h: ${escapeHtml(shortUsd(pair.volumeH24))}`
+        ].join("\n");
+
+        await sendText(row.chat_id, text, buildWatchlistItemMenu(pair));
+        await run(`UPDATE watchlist SET last_alert_ts = ?, updated_at = ? WHERE id = ?`, [nowTs(), nowTs(), row.id]);
+      }
+
+      await run(
+        `UPDATE watchlist SET pair_address = ?, symbol = ?, last_price = ?, last_liquidity = ?, last_volume = ?, last_score = ?, updated_at = ? WHERE id = ?`,
+        [String(pair.pairAddress || ''), String(pair.baseSymbol || ''), newPrice, newLiq, num(pair.volumeH24), verdict.score, nowTs(), row.id]
+      );
     } catch (err) {
-      console.error("monitorWalletLoop error:", err.message);
+      console.log("scanWatchlistAlerts item error:", err.message);
     }
-    await sleep(90000);
   }
 }
 
-bot.onText(/^\/start(?:\s+(.+))?$/, async (msg, match) => {
-  try {
-    await ensureUser(msg);
-    const chatId = msg.chat.id;
-    const refCode = normalizeText(match?.[1] || "");
-    if (!(await enforceMembership(chatId))) return;
-    await sendWelcome(chatId, refCode);
-  } catch (err) {
-    console.error("/start error:", err.message);
-  }
-});
+// ================= HANDLERS =================
+async function registerHandlers() {
+  bot.onText(/\/start/, async (msg) => {
+    try {
+      if (!isPrivateChat(msg)) return;
 
-bot.onText(/^\/menu$/, async (msg) => {
-  try {
-    await ensureUser(msg);
-    if (!(await enforceMembership(msg.chat.id))) return;
-    await sendWelcome(msg.chat.id);
-  } catch (err) {
-    console.error("/menu error:", err.message);
-  }
-});
+      await upsertUserFromMessage(msg, 0);
 
-bot.onText(/^\/help$/, async (msg) => {
-  try {
-    await ensureUser(msg);
-    if (!(await enforceMembership(msg.chat.id))) return;
-    await sendHelp(msg.chat.id);
-  } catch (err) {
-    console.error("/help error:", err.message);
-  }
-});
+      const ok = await ensureSubscribedOrBlock(msg);
+      if (!ok) return;
 
-bot.on("message", async (msg) => {
-  try {
-    if (!msg.text || msg.text.startsWith("/start") || msg.text === "/menu" || msg.text === "/help") return;
-    await ensureUser(msg);
-    await handleFreeText(msg);
-  } catch (err) {
-    console.error("message handler error:", err.message);
-  }
-});
-
-bot.on("callback_query", async (query) => {
-  const chatId = query.message?.chat?.id;
-  const messageId = query.message?.message_id;
-  const data = query.data || "";
-
-  if (!chatId || !messageId) {
-    await answerCb(query.id);
-    return;
-  }
-
-  try {
-    if (!(await enforceMembership(chatId))) {
-      await answerCb(query.id);
-      return;
+      await showMainMenu(msg.chat.id);
+    } catch (err) {
+      console.log("/start error:", err.message);
     }
+  });
 
-    if (data === "verify_access") {
-      const ok = await verifyMembership(chatId);
-      if (ok) {
-        await answerCb(query.id, "Access verified");
-        await editText(chatId, messageId, "Access verified. Welcome to GorKtimus.", buildMainMenu());
-      } else {
-        await answerCb(query.id, "Still not verified");
+  bot.onText(/\/menu/, async (msg) => {
+    try {
+      if (!isPrivateChat(msg)) return;
+
+      await upsertUserFromMessage(msg, 0);
+
+      const ok = await ensureSubscribedOrBlock(msg);
+      if (!ok) return;
+
+      await showMainMenu(msg.chat.id);
+    } catch (err) {
+      console.log("/menu error:", err.message);
+    }
+  });
+
+  bot.onText(/\/scan(?:\s+(.+))?/, async (msg, match) => {
+    try {
+      if (!isPrivateChat(msg)) return;
+
+      await upsertUserFromMessage(msg, 0);
+
+      const ok = await ensureSubscribedOrBlock(msg);
+      if (!ok) return;
+
+      const chatId = msg.chat.id;
+      const query = String(match?.[1] || "").trim();
+      if (!query) {
+        await promptScanToken(chatId);
+        return;
       }
-      return;
+      await runTokenScan(chatId, query);
+    } catch (err) {
+      console.log("/scan error:", err.message);
     }
+  });
 
-    if (data === "main_menu") {
-      await answerCb(query.id);
-      await editText(chatId, messageId, "<b>GorKtimus Main Menu</b>\n\nChoose your command center below.", buildMainMenu());
-      return;
+  bot.onText(/\/watchlist/, async (msg) => {
+    try {
+      if (!isPrivateChat(msg)) return;
+      await upsertUserFromMessage(msg, 0);
+      const ok = await ensureSubscribedOrBlock(msg);
+      if (!ok) return;
+      await showWatchlist(msg.chat.id);
+    } catch (err) {
+      console.log("/watchlist error:", err.message);
     }
+  });
 
-    if (data === "menu_scan") {
-      await setExpecting(chatId, "scan_query");
-      await answerCb(query.id);
-      await editText(chatId, messageId, "Send a token ticker, token name, or contract address to scan.", {
-        reply_markup: { inline_keyboard: [buildBackMenuRow()] },
-        parse_mode: "HTML"
-      });
-      return;
+  bot.onText(/\/mode/, async (msg) => {
+    try {
+      if (!isPrivateChat(msg)) return;
+      await upsertUserFromMessage(msg, 0);
+      const ok = await ensureSubscribedOrBlock(msg);
+      if (!ok) return;
+      await showModeLab(msg.chat.id);
+    } catch (err) {
+      console.log("/mode error:", err.message);
     }
+  });
 
-    if (data === "menu_trending") {
-      await answerCb(query.id);
-      await sendTrending(chatId);
-      return;
-    }
+  bot.on("callback_query", async (query) => {
+    const chatId = query.message?.chat?.id;
+    const data = query.data || "";
 
-    if (data === "menu_watchlist") {
-      await answerCb(query.id);
-      await sendWatchlist(chatId);
-      return;
-    }
+    try {
+      await answerCallbackSafe(query.id);
 
-    if (data === "menu_alerts") {
-      await answerCb(query.id);
-      await sendAlerts(chatId);
-      return;
-    }
+      if (!chatId) return;
+      if (!isPrivateChat(query)) return;
 
-    if (data === "menu_wallets") {
-      await setExpecting(chatId, "wallet_add");
-      await answerCb(query.id);
-      await editText(chatId, messageId, [
-        "<b>Wallet Tracking</b>",
-        "",
-        "Send wallet details in this format:",
-        "<code>wallet_address | whale | nickname</code>"
-      ].join("\n"), {
-        reply_markup: { inline_keyboard: [buildBackMenuRow()] },
-        parse_mode: "HTML"
-      });
-      return;
-    }
-
-    if (data === "menu_ai") {
-      await setExpecting(chatId, "ai_prompt");
-      await answerCb(query.id);
-      await editText(chatId, messageId, "Ask your question in plain language. Example: <code>why is low liquidity dangerous</code>", {
-        reply_markup: { inline_keyboard: [buildBackMenuRow()] },
-        parse_mode: "HTML"
-      });
-      return;
-    }
-
-    if (data === "menu_settings") {
-      await answerCb(query.id);
-      await sendSettings(chatId);
-      return;
-    }
-
-    if (data === "menu_help") {
-      await answerCb(query.id);
-      await sendHelp(chatId);
-      return;
-    }
-
-    if (data === "menu_referrals") {
-      await answerCb(query.id);
-      await sendReferrals(chatId);
-      return;
-    }
-
-    if (data === "mode_fast" || data === "mode_balanced" || data === "mode_deep") {
-      const nextMode = data.replace("mode_", "");
-      await setMode(chatId, nextMode);
-      await answerCb(query.id, "Mode updated");
-      await editText(chatId, messageId, `Mode updated to <b>${escapeHtml(nextMode)}</b>.`, buildModeButtons(nextMode));
-      return;
-    }
-
-    if (data === "toggle_alert_price") {
-      const settings = await toggleSetting(chatId, "price_alerts");
-      await answerCb(query.id);
-      await editText(chatId, messageId, "<b>Alerts Control Center</b>\n\nToggle what you want active below.", buildAlertsMenu(settings));
-      return;
-    }
-
-    if (data === "toggle_alert_liq") {
-      const settings = await toggleSetting(chatId, "liq_alerts");
-      await answerCb(query.id);
-      await editText(chatId, messageId, "<b>Alerts Control Center</b>\n\nToggle what you want active below.", buildAlertsMenu(settings));
-      return;
-    }
-
-    if (data === "toggle_alert_risk") {
-      const settings = await toggleSetting(chatId, "risk_alerts");
-      await answerCb(query.id);
-      await editText(chatId, messageId, "<b>Alerts Control Center</b>\n\nToggle what you want active below.", buildAlertsMenu(settings));
-      return;
-    }
-
-    if (data === "toggle_alert_wallet") {
-      const settings = await toggleSetting(chatId, "wallet_alerts");
-      await answerCb(query.id);
-      await editText(chatId, messageId, "<b>Alerts Control Center</b>\n\nToggle what you want active below.", buildAlertsMenu(settings));
-      return;
-    }
-
-    if (data.startswith && false) {
-      // placeholder to keep linter calm in some editors
-    }
-
-    if (data.startsWith("add_watch:")) {
-      const q = decodeURIComponent(data.split(":")[1] || "");
-      const { bestPair } = await scanToken(q);
-      if (bestPair) {
-        const risk = scorePair(bestPair);
-        await upsertWatchlist(chatId, q, bestPair, risk.score);
-        await answerCb(query.id, "Added to watchlist");
-      } else {
-        await answerCb(query.id, "No pair found");
+      if (data === "check_subscription") {
+        const ok = await ensureSubscribedOrBlock(query);
+        if (!ok) {
+          await answerCallbackSafe(query.id, "Still not subscribed yet.");
+          return;
+        }
+        await answerCallbackSafe(query.id, "Access unlocked.");
+        await showMainMenu(chatId);
+        return;
       }
-      return;
-    }
 
-    if (data.startsWith("rescan:")) {
-      const q = decodeURIComponent(data.split(":")[1] || "");
-      await answerCb(query.id, "Rescanning");
-      await runScanAndRespond(chatId, q, false);
-      return;
-    }
+      const ok = await ensureSubscribedOrBlock(query);
+      if (!ok) return;
 
-    if (data.startsWith("trend_scan:")) {
-      const address = decodeURIComponent(data.split(":")[1] || "");
-      await answerCb(query.id, "Scanning token");
-      await runScanAndRespond(chatId, address, false);
-      return;
-    }
-
-    if (data.startsWith("watch_scan:")) {
-      const watchId = Number(data.split(":")[1] || 0);
-      const row = await get(`SELECT * FROM watchlist WHERE id = ? AND chat_id = ?`, [watchId, String(chatId)]);
-      if (row) {
-        await answerCb(query.id, "Scanning watchlist token");
-        await runScanAndRespond(chatId, row.contract_address || row.query, false);
-      } else {
-        await answerCb(query.id, "Not found");
+      if (data === "main_menu") {
+        pendingAction.delete(chatId);
+        await showMainMenu(chatId);
+      } else if (data === "scan_token") {
+        await promptScanToken(chatId);
+      } else if (data === "trending") {
+        await showTrending(chatId);
+      } else if (data === "launch_radar") {
+        await showLaunchRadar(chatId);
+      } else if (data === "prime_picks") {
+        await showPrimePicks(chatId);
+      } else if (data === "watchlist") {
+        await showWatchlist(chatId);
+      } else if (data === "mode_lab") {
+        await showModeLab(chatId);
+      } else if (data === "alert_center") {
+        await showAlertCenter(chatId);
+      } else if (data === "edge_brain") {
+        await showEdgeBrain(chatId);
+      } else if (data === "ai_assistant") {
+        await showAIAssistantIntro(chatId);
+      } else if (data === "whale_menu") {
+        await showWhaleMenu(chatId);
+      } else if (data === "help_menu") {
+        await showHelpMenu(chatId);
+      } else if (data === "help_status") {
+        await showSystemStatus(chatId);
+      } else if (data === "help_how") {
+        await showHowToUse(chatId);
+      } else if (data === "help_engine") {
+        await showHowGorktimusWorks(chatId);
+      } else if (data === "help_dex_diff") {
+        await showWhyDifferentFromDex(chatId);
+      } else if (data === "help_transactions") {
+        await showTransactionsExplained(chatId);
+      } else if (data === "help_score") {
+        await showScoreExplained(chatId);
+      } else if (data === "help_sources") {
+        await showDataSources(chatId);
+      } else if (data === "help_community") {
+        await showCommunity(chatId);
+      } else if (data === "invite_friends") {
+        await showInviteFriends(chatId);
+      } else if (data.startsWith("set_mode:")) {
+        const mode = safeMode(data.split(":")[1]);
+        await setUserSetting(chatId, "mode", mode);
+        await answerCallbackSafe(query.id, `Mode set to ${modeTitle(mode)}`);
+        await showModeLab(chatId);
+      } else if (data.startsWith("toggle_setting:")) {
+        const field = String(data.split(":")[1] || "");
+        const settings = await getUserSettings(chatId);
+        const current = num(settings[field]);
+        await setUserSetting(chatId, field, current ? 0 : 1);
+        await showAlertCenter(chatId);
+      } else if (data.startsWith("trend_copy:")) {
+        const parts = data.split(":");
+        const chainId = parts[1];
+        const tokenAddress = parts[2];
+        const pair = await resolveExactPairOrToken(chainId, tokenAddress);
+        const address = pair?.baseAddress || tokenAddress;
+        await sendText(
+          chatId,
+          `📋 <b>${escapeHtml(pair?.baseSymbol || "Token")} Address</b>\n\n<code>${escapeHtml(address)}</code>`,
+          buildMainMenuOnlyButton()
+        );
+      } else if (data.startsWith("trend_scan:")) {
+        const parts = data.split(":");
+        const chainId = parts[1];
+        const tokenAddress = parts[2];
+        const pair = await resolveExactPairOrToken(chainId, tokenAddress);
+        if (pair) {
+          const imageUrl = await fetchTokenProfileImage(pair.chainId, pair.baseAddress, pair);
+          await sendCard(chatId, await buildScanCard(pair, "📈 Trending Scan", chatId), buildScanActionButtons(pair), imageUrl);
+        }
+      } else if (data.startsWith("watch_add:")) {
+        const parts = data.split(":");
+        const chainId = parts[1];
+        const tokenAddress = parts[2];
+        const pair = await resolveExactPairOrToken(chainId, tokenAddress);
+        if (pair) {
+          await addWatchlistItem(chatId, pair);
+          await answerCallbackSafe(query.id, "Added to watchlist.");
+        }
+      } else if (data.startsWith("watch_open:")) {
+        const parts = data.split(":");
+        await showWatchlistItem(chatId, parts[1], parts[2]);
+      } else if (data.startsWith("watch_rescan:")) {
+        const parts = data.split(":");
+        const pair = await resolveExactPairOrToken(parts[1], parts[2]);
+        if (pair) {
+          const imageUrl = await fetchTokenProfileImage(pair.chainId, pair.baseAddress, pair);
+          await sendCard(chatId, await buildScanCard(pair, "🔁 Watchlist Re-Scan", chatId), buildWatchlistItemMenu(pair), imageUrl);
+          const verdict = await buildRiskVerdict(pair, chatId);
+          await savePairMemorySnapshot(pair, verdict.score);
+        }
+      } else if (data.startsWith("watch_remove:")) {
+        const parts = data.split(":");
+        await removeWatchlistItem(chatId, parts[1], parts[2]);
+        await answerCallbackSafe(query.id, "Removed from watchlist.");
+        await showWatchlist(chatId);
+      } else if (data.startsWith("feedback:")) {
+        const parts = data.split(":");
+        const feedback = parts[1];
+        const pair = await resolveExactPairOrToken(parts[2], parts[3]);
+        if (pair) {
+          const verdict = await buildRiskVerdict(pair, chatId);
+          await addScanFeedback(chatId, pair, feedback, verdict.score);
+          await answerCallbackSafe(query.id, feedback === "good" ? "Logged as good call." : "Logged as bad call.");
+        }
+      } else if (data === "add_whale") {
+        pendingAction.set(chatId, { type: "ADD_WHALE_WALLET" });
+        await sendText(
+          chatId,
+          `🧠 <b>Gorktimus Intelligence Terminal</b>\n\n🐋 Send a Solana whale wallet address.`,
+          buildMainMenuOnlyButton()
+        );
+      } else if (data === "add_dev") {
+        pendingAction.set(chatId, { type: "ADD_DEV_WALLET" });
+        await sendText(
+          chatId,
+          `🧠 <b>Gorktimus Intelligence Terminal</b>\n\n👤 Send a Solana dev wallet address.`,
+          buildMainMenuOnlyButton()
+        );
+      } else if (data === "whale_list") {
+        await showWalletList(chatId, "whale");
+      } else if (data === "dev_list") {
+        await showWalletList(chatId, "dev");
+      } else if (data === "check_wallet") {
+        pendingAction.set(chatId, { type: "CHECK_WALLET" });
+        await sendText(
+          chatId,
+          `🧠 <b>Gorktimus Intelligence Terminal</b>\n\n🔍 Send a Solana wallet address to check.`,
+          buildMainMenuOnlyButton()
+        );
+      } else if (data === "wallet_alert_settings") {
+        await showWalletAlertSettings(chatId);
+      } else if (data.startsWith("wallet_item:")) {
+        const id = Number(data.split(":")[1]);
+        if (Number.isFinite(id)) await showWalletItem(chatId, id);
+      } else if (data.startsWith("wallet_toggle:")) {
+        const id = Number(data.split(":")[1]);
+        if (Number.isFinite(id)) await toggleWalletAlerts(chatId, id);
+      } else if (data.startsWith("wallet_check:")) {
+        const id = Number(data.split(":")[1]);
+        if (Number.isFinite(id)) await checkWalletNow(chatId, id);
+      } else if (data.startsWith("wallet_rename:")) {
+        const id = Number(data.split(":")[1]);
+        if (Number.isFinite(id)) {
+          pendingAction.set(chatId, { type: "RENAME_WALLET", id });
+          await sendText(
+            chatId,
+            `🧠 <b>Gorktimus Intelligence Terminal</b>\n\n✏️ Send the new wallet name.`,
+            buildMainMenuOnlyButton()
+          );
+        }
+      } else if (data.startsWith("wallet_remove:")) {
+        const id = Number(data.split(":")[1]);
+        if (Number.isFinite(id)) await removeWallet(chatId, id);
       }
-      return;
+    } catch (err) {
+      console.log("callback error:", err.message);
+      if (chatId) {
+        await sendText(
+          chatId,
+          `🧠 <b>Gorktimus Intelligence Terminal</b>\n\n❌ Something glitched.`,
+          buildMainMenuOnlyButton()
+        ).catch(() => {});
+      }
+    }
+  });
+
+  bot.on("message", async (msg) => {
+    try {
+      if (!isPrivateChat(msg)) return;
+
+      const chatId = msg.chat.id;
+      const text = msg.text;
+
+      await upsertUserFromMessage(msg, 0);
+      await trackUserActivity(msg.from.id);
+
+      if (!text) return;
+      if (text.startsWith("/start") || text.startsWith("/menu") || text.startsWith("/scan")) return;
+
+      const ok = await ensureSubscribedOrBlock(msg);
+      if (!ok) return;
+
+      const handled = await handlePendingAction(chatId, text);
+      if (handled) return;
+
+      const cleaned = text.trim();
+      if (isAddressLike(cleaned)) {
+        await trackScan(chatId);
+        await runTokenScan(chatId, cleaned);
+        return;
+      }
+
+      if (/^[A-Za-z0-9_.$-]{2,24}$/.test(cleaned) && !cleaned.startsWith("/")) {
+        await runTokenScan(chatId, cleaned);
+      }
+    } catch (err) {
+      console.log("message handler error:", err.message);
+    }
+  });
+
+  bot.on("polling_error", (err) => {
+    console.log("Polling error:", err.code, err.message);
+  });
+
+  bot.on("error", (err) => {
+    console.log("Bot error:", err.message);
+  });
+}
+
+// ================= CLEAN SHUTDOWN =================
+async function shutdown(signal) {
+  if (shuttingDown) return;
+  shuttingDown = true;
+
+  console.log(`🛑 Shutdown signal received: ${signal}`);
+
+  try {
+    if (walletScanInterval) clearInterval(walletScanInterval);
+    if (watchlistScanInterval) clearInterval(watchlistScanInterval);
+
+    if (bot) {
+      try {
+        await bot.stopPolling();
+        console.log("✅ Polling stopped cleanly");
+      } catch (err) {
+        console.log("stopPolling error:", err.message);
+      }
     }
 
-    if (data.startsWith("watch_remove:")) {
-      const watchId = Number(data.split(":")[1] || 0);
-      await removeWatchlist(chatId, watchId);
-      await answerCb(query.id, "Removed");
-      await sendWatchlist(chatId);
-      return;
-    }
+    db.close(() => {
+      console.log("✅ DB closed");
+      process.exit(0);
+    });
 
-    await answerCb(query.id);
+    setTimeout(() => process.exit(0), 3000);
   } catch (err) {
-    console.error("callback_query error:", err.message);
-    await answerCb(query.id, "Something went wrong");
+    console.log("shutdown error:", err.message);
+    process.exit(0);
   }
-});
+}
 
-process.on("SIGINT", () => {
-  console.log("Shutting down...");
-  db.close();
-  process.exit(0);
-});
+process.once("SIGTERM", () => shutdown("SIGTERM"));
+process.once("SIGINT", () => shutdown("SIGINT"));
 
-process.on("SIGTERM", () => {
-  console.log("Shutting down...");
-  db.close();
-  process.exit(0);
-});
-
-process.on("unhandledRejection", (err) => {
-  console.error("Unhandled rejection:", err);
-});
-
-process.on("uncaughtException", (err) => {
-  console.error("Uncaught exception:", err);
-});
-
-async function bootstrap() {
+// ================= BOOT =================
+(async () => {
   await initDb();
 
+  bot = new TelegramBot(BOT_TOKEN, {
+    polling: {
+      autoStart: false,
+      interval: 1000,
+      params: { timeout: 10 }
+    }
+  });
+
   try {
-    await bot.deleteWebHook();
-    console.log("Webhook cleared");
+    await bot.deleteWebHook({ drop_pending_updates: false });
+    console.log("✅ Webhook cleared");
   } catch (err) {
-    console.error("Webhook clear warning:", err.message);
+    console.log("deleteWebHook warning:", err.message);
   }
 
-  console.log("GorKtimus New Update booting...");
-  monitorWatchlistLoop().catch((err) => console.error("watchlist loop fatal:", err.message));
-  monitorWalletLoop().catch((err) => console.error("wallet loop fatal:", err.message));
-}
+  try {
+    const me = await bot.getMe();
+    BOT_USERNAME = me?.username || "";
+  } catch (err) {
+    console.log("getMe warning:", err.message);
+  }
 
-bootstrap().catch((err) => {
-  console.error("Fatal bootstrap error:", err);
-  process.exit(1);
-});
+  await registerHandlers();
+  await bot.startPolling();
+
+  console.log("🧠 Gorktimus Intelligence Terminal Running...");
+  console.log("🖼️ Menu image exists:", fs.existsSync(TERMINAL_IMG));
+  console.log("🔑 Helius enabled:", hasHelius());
+  console.log("🔑 Etherscan enabled:", hasEtherscanKey());
+  console.log("📢 Required channel:", REQUIRED_CHANNEL);
+  console.log("🤖 Bot username:", BOT_USERNAME || "unknown");
+
+  if (hasHelius()) {
+    walletScanInterval = setInterval(() => {
+      scanWalletTracks();
+    }, WALLET_SCAN_INTERVAL_MS);
+  }
+})();
