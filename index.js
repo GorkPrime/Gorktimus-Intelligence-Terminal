@@ -1046,17 +1046,7 @@ process.once("SIGINT", () => shutdown("SIGINT"));
 
 {;
         
- { transparencyScore = proxy ? 11 : 15;
-        transparencyLabel = "Unverified";
-        transparencyEmoji = "⚠️";
-        transparencyScore = 3;
-      }
-
-    transparencyDetail = [
-        `Source: ${hasSource ? "yes" : "no"}`,
-        `ABI: ${hasAbi ? "yes" : "no"}`,
-        `Proxy: ${proxy || implementation ? "yes" : "no"}`
-      ].join(" | ");
+ ;
     } 
    {
       transparencyLabel = hasEtherscanKey() ? "Unavailable" : "No Etherscan Key";
