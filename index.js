@@ -404,7 +404,7 @@ function makeBirdeyeUrl(chainId, tokenAddress) {
 async function showEdgeBrain(chatId) {
   await sendText(
     chatId,
-    "<b>GorKtimus Edge Brain</b>\n\nThis section will hold deeper defense logic, behavioral analysis, and advanced explanations.",
+    "<b>Gorktimus Edge Brain</b>\n\nGorktimus Edge is the advanced defense brain of the terminal — the layer that goes beyond basic token stats and turns raw market activity into real protective intelligence. It is built to detect traps, read behavior patterns, analyze launch structure, judge momentum quality, flag suspicious wallet and liquidity movement, and explain in plain language why a token may be safe, risky, manipulated, or worth watching. Instead of just showing numbers, Edge is meant to act like a live guardian system that studies what the token is doing, how it is moving, who may be controlling it, and what that means for the user before they make a decision.",
     buildMainMenu()
   );
 }
@@ -434,7 +434,7 @@ function getMsgChat(msgOrQuery) {
 async function showMainMenu(chatId) {
   await sendText(
     chatId,
-    "<b>GorKtimus Main Menu</b>\n\nChoose your command center below.",
+    "<b>Gorktimus Main Menu</b>\n\nChoose your command center below.",
     buildMainMenu()
   );
 }async function promptScanToken(chatId) {
