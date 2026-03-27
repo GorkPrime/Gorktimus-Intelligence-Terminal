@@ -1115,7 +1115,7 @@ async function resolveBestPair(query) {
   pairCache.set(cacheKey, { ts: Date.now(), data: result });
   return result;
 }
-}
+
 async function fetchLatestProfiles() {
   try {
     const data = await safeGet("https://api.dexscreener.com/token-profiles/latest/v1");
