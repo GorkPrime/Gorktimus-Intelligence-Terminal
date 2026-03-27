@@ -2323,9 +2323,23 @@ if (data.startsWith("watch_rescan:")) {
     if (data === "help_engine") {
       return sendText(chatId, `🧠 <b>How Gorktimus Works</b>\n\nGorktimus scans live pairs, scores structure, reads liquidity, flow, holder concentration, transparency, and trap risk, then turns it into plain-language guidance.`, buildHelpMenu());
     }
-
-    if (data === "help_dex_diff") {
-      return sendText(chatId, `🧠 <b>Why Gorktimus Differs From Dex</b>\n\nDex is raw discovery. Gorktimus is filtered intelligence. It is supposed to be different because it weighs structure, not just raw visibility.`, buildHelpMenu());
+Dex is a raw activity feed.`,
+    `Gorktimus is a filtered intelligence layer.`,
+    ``,
+    `Dex can surface tokens because they are simply loud:`,
+    `• volume spikes`,
+    `• transaction bursts`,
+    `• paid boosts`,
+    `• very early launches`,
+    ``,
+    `Gorktimus can deliberately rank those lower if the structure looks weak:`,
+    `• thin liquidity`,
+    `• suspicious holder concentration`,
+    `• dangerous tax / honeypot signals`,
+    `• poor contract transparency`,
+    `• one-sided or spammy transaction patterns`,
+    ``,
+    `So if a token is high on Dex but lower here, that usually means the terminal thinks the raw noise is stronger than the underlying structure.sibility.`, buildHelpMenu());
     }
 
     if (data === "help_score") {
