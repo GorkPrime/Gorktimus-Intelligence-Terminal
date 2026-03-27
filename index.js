@@ -1150,8 +1150,7 @@ async function fetchHeliusTokenLargestAccounts(mint) {
         }
       }console.warn(`Helius largest accounts skipped for ${mint} after retries`);
 return null;
-    );
-
+  
     const rows = Array.isArray(data?.result?.value) ? data.result.value : [];
     return rows.map((x) => ({
       address: String(x.address || ""),
@@ -1169,11 +1168,6 @@ async function fetchEvmHoneypot(address, chainId) {
   if (!address || !isEvmChain(chainId)) return null;
   const chain = String(chainId).toLowerCase();
   const mappedChainId = EVM_CHAIN_IDS[chain];
-const largestAccounts = await fetchHeliusTokenLargestAccounts(mint);
-
-if (!largestAccounts) {
-  lines.push("• Holder concentration: temporarily unavailable");
-}
   const strategies = [
     async () => {
       const res = await axios.get(`${HONEYPOT_API_BASE}/v2/IsHoneypot`, {
