@@ -1142,10 +1142,6 @@ async function fetchTokenProfileImage(chainId, tokenAddress, fallbackPair = null
 }
 
 // ================= CHAIN INTELLIGENCE =================
-function sleep(ms) {
-  return new Promise(resolve => setTimeout(resolve, ms));
-}
-
 
 async function fetchEvmHoneypot(address, chainId) {
   if (!address || !isEvmChain(chainId)) return null;
@@ -1915,7 +1911,7 @@ async function showLaunchRadar(chatId) {
 
   for (const p of profiles.slice(0, 25)) {
     if (!supportsChain(p.chainId)) continue;
-    const pair = await resolveTokenToBestPair(p.chainId, p.tokenAddress);
+   const pair = await resolveBestPair(p.tokenAddress);
     if (!pair) continue;
     const ageMin = ageMinutesFromMs(pair.pairCreatedAt);
     if (pair.liquidityUsd >= LAUNCH_MIN_LIQ_USD && pair.volumeH24 >= LAUNCH_MIN_VOL_USD && ageMin <= 1440) {
