@@ -1147,20 +1147,11 @@ async function fetchHeliusTokenLargestAccounts(mint) {
 
   console.warn(`Helius largest accounts skipped for ${mint} after retries`);
   return null;
-      }
-      {
-        attempts: 2,
-        baseDelay: 5000,
-        maxDelay: 15000,
-        backoff: 2,
-        shouldRetry: (err) => {
-          const status = err?.response?.status;
-          return [408, 425, 500, 502, 503, 504].includes(status) ||
-            err?.code === "ECONNABORTED" ||
-            err?.code === "ETIMEDOUT" ||
-            err?.code === "ECONNRESET";
+    
         }
-      }
+      }console.warn(`Helius largest accounts skipped for ${mint} after retries`);
+return null;
+}
     );
 
     const rows = Array.isArray(data?.result?.value) ? data.result.value : [];
