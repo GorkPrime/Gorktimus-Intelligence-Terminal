@@ -1117,49 +1117,35 @@ function sleep(ms) {
   return new Promise(resolve => setTimeout(resolve, ms));
 }
 async function fetchHeliusTokenLargestAccounts(mint) {
-  let tries = 0;
-
-  while (tries < 4) {
-    try {
-      const res = await axios.post(HELIUS_RPC_URL, {
+  try {
+    const res = await axios.post(
+      HELIUS_RPC_URL,
+      {
         jsonrpc: "2.0",
         id: "largest-accounts",
         method: "getTokenLargestAccounts",
         params: [mint]
-      }, {
+      },
+      {
         timeout: 15000
-      });
-
-      return res.data?.result?.value || [];
-    } catch (err) {
-      const status = err?.response?.status;
-
-      if (status === 429) {
-        tries += 1;
-        console.warn(`Helius 429 on largest accounts for ${mint}. Retry ${tries}/4`);
-        await sleep(1500 * tries);
-        continue;
       }
+    );
 
-      throw err;
-    }
+    const rows = Array.isArray(res?.data?.result?.value)
+      ? res.data.result.value
+      : [];
 
-  console.warn(`Helius largest accounts skipped for ${mint} after retries`);
-  return null;
-    
-        }
-      }console.warn(`Helius largest accounts skipped for ${mint} after retries`);
-return null;
-  
-    const rows = Array.isArray(data?.result?.value) ? data.result.value : [];
     return rows.map((x) => ({
       address: String(x.address || ""),
       amountRaw: String(x.amount || "0"),
       uiAmount: num(x.uiAmountString ?? x.uiAmount ?? 0),
       decimals: num(x.decimals, 0)
-       }));
+    }));
   } catch (err) {
-    console.log("fetchHeliusTokenLargestAccounts error:", err?.response?.status || err.message);
+    console.log(
+      "fetchHeliusTokenLargestAccounts error:",
+      err?.response?.status || err.message
+    );
     return [];
   }
 }
