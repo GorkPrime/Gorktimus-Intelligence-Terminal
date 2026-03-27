@@ -2329,8 +2329,7 @@ if (data.startsWith("watch_rescan:")) {
     `• explains the result in plain language`,
     ``,
     `That means it is trying to answer a harder question than “what is moving?”`,
-    `It is trying to answer “what is moving, how clean is it, and what could be hiding underneath that movement?”`,
-    ``,
+    `It is trying to answer “what is moving, how clean is it, and what could be hiding underneath that movement?
     `So when you scan a token, you are not just getting price and liquidity. You are also getting holder concentration context, contract transparency clues, behavior signals, memory bias from prior outcomes, and mode-aware score shaping., buildHelpMenu());
     }
     
