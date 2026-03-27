@@ -1045,38 +1045,70 @@ async function resolveBestPair(query) {
   const q = String(query || "").trim();
   if (!q) return null;
 
-  if (isAddressLike(q)) {
-    const chainCandidates = q.startsWith("0x") ? ["base", "ethereum"] : ["solana"];
-    const byTokenResults = [];
+  const cacheKey = q.toLowerCase();
+  const now = Date.now();
+  const cached = pairCache.get(cacheKey);
 
-    for (const chainId of chainCandidates) {
-      try {
-        const pairs = await fetchPairsByToken(chainId, q);
-        byTokenResults.push(...pairs);
-      } catch (_) {}
-    }
+  if (cached && now - cached.ts < 5000) {
+    return cached.data;
+  }
 
-    if (byTokenResults.length) {
-      return byTokenResults.sort((a, b) => rankPairQuality(b) - rankPairQuality(a))[0];
+  let result = null;
+  let tries = 0;
+
+  while (tries < 3) {
+    try {
+      if (isAddressLike(q)) {
+        const chainCandidates = q.startsWith("0x") ? ["base", "ethereum"] : ["solana"];
+        const byTokenResults = [];
+
+        for (const chainId of chainCandidates) {
+          try {
+            const pairs = await fetchPairsByToken(chainId, q);
+            byTokenResults.push(...pairs);
+            await sleep(250);
+          } catch (_) {}
+        }
+
+        if (byTokenResults.length) {
+          result = byTokenResults.sort((a, b) => rankPairQuality(b) - rankPairQuality(a))[0];
+          break;
+        }
+      }
+
+      const pairs = await searchDexPairs(q);
+      if (!pairs.length) {
+        result = null;
+        break;
+      }
+
+      const lowered = q.toLowerCase();
+      result = pairs.sort((a, b) => {
+        const exactA = String(a.baseSymbol || "").toLowerCase() === lowered;
+        const exactB = String(b.baseSymbol || "").toLowerCase() === lowered;
+        if (exactA !== exactB) return exactB - exactA;
+        return rankPairQuality(b) - rankPairQuality(a);
+      })[0];
+
+      break;
+    } catch (err) {
+      const status = err?.response?.status;
+
+      if (status === 429) {
+        tries += 1;
+        console.log(`resolveBestPair 429 for ${q}. Retry ${tries}/3`);
+        await sleep(1500 * tries);
+        continue;
+      }
+
+      console.log("resolveBestPair error:", err.message);
+      return null;
     }
   }
 
-  try {
-    const pairs = await searchDexPairs(q);
-    if (!pairs.length) return null;
-    const lowered = q.toLowerCase();
-    return pairs.sort((a, b) => {
-      const exactA = String(a.baseSymbol || "").toLowerCase() === lowered;
-      const exactB = String(b.baseSymbol || "").toLowerCase() === lowered;
-      if (exactA !== exactB) return exactB - exactA;
-      return rankPairQuality(b) - rankPairQuality(a);
-    })[0];
-  } catch (err) {
-    console.log("resolveBestPair error:", err.message);
-    return null;
-  }
+  pairCache.set(cacheKey, { ts: Date.now(), data: result });
+  return result;
 }
-
 async function fetchLatestProfiles() {
   try {
     const data = await safeGet("https://api.dexscreener.com/token-profiles/latest/v1");
