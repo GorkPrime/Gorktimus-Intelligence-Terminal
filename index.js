@@ -1,5 +1,11 @@
 const TelegramBot = require("node-telegram-bot-api");
 const axios = require("axios");
+const liveTokenState = new Map();
+const tokenSnapshots = new Map()
+const liveTokenTxs = new Map();
+const activeBirdeyeSubscriptions = new Set();
+const LIVE_STATE_MAX_AGE_MS = 5000;
+const RECENT_TX_BUFFER_LIMIT = 25;
 const largestAccountsCache = new Map();
 const largestAccountsInflight = new Map();
 function jitter(ms) {
