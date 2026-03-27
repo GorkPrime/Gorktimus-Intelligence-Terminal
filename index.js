@@ -1046,12 +1046,8 @@ async function fetchPairsByToken(chainId, tokenAddress) {
   const pairs = Array.isArray(data) ? data : [];
   return pairs.map(normalizePair).filter((p) => p && supportsChain(p.chainId));
 }
-  const cached = pairCache.get(cacheKey);
-  
-function sleep(ms) {
-  return new Promise(resolve => setTimeout(resolve, ms));
-}
-  async function resolveBestPair(query) {
+ 
+async function resolveBestPair(query) {
   const q = String(query || "").trim();
   if (!q) return null;
 
@@ -1118,6 +1114,7 @@ function sleep(ms) {
 
   pairCache.set(cacheKey, { ts: Date.now(), data: result });
   return result;
+}
 }
 async function fetchLatestProfiles() {
   try {
