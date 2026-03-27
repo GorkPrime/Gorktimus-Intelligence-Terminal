@@ -36,7 +36,13 @@ if (DEV_MODE && !isOwner(chatId)) {
   );
   return;
 }
-
+if (DEV_MODE && !isOwner(chatId)) {
+  await answerCallbackQuerySafe(bot, query.id, {
+    text: "Private development mode active.",
+    show_alert: false
+  });
+  return;
+}
 function isPrivateChat(msgOrQuery) {
   const chat =
     msgOrQuery?.chat ||
