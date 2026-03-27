@@ -60,7 +60,7 @@ const EVM_CHAIN_IDS = {
 };
 
 // ================= GLOBALS =================
-const largestAccountsCache = new Map();
+
 const LARGEST_ACCOUNTS_TTL_MS = 60000;
 const db = new sqlite3.Database(DB_PATH);
 const HELIUS_MIN_SPACING_MS = 150;
