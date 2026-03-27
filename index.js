@@ -265,9 +265,7 @@ function nowTs() {
   return Math.floor(Date.now() / 1000);
 }
 
-function sleep(ms) {
-  return new Promise((resolve) => setTimeout(resolve, ms));
-}
+
 
 function escapeHtml(value) {
   return String(value || "")
