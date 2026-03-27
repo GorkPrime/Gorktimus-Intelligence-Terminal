@@ -48,6 +48,8 @@ const EVM_CHAIN_IDS = {
 };
 
 // ================= GLOBALS =================
+const largestAccountsCache = new Map();
+const LARGEST_ACCOUNTS_TTL_MS = 60000;
 const db = new sqlite3.Database(DB_PATH);
 const bot = new TelegramBot(BOT_TOKEN, { polling: true });
 const pendingAction = new Map();
@@ -224,6 +226,45 @@ async function initDb() {
 }
 
 // ================= BASIC HELPERS =================
+async function fetchHeliusTokenLargestAccounts(mint) {
+  const now = Date.now();
+  const cached = largestAccountsCache.get(mint);
+
+  if (cached && (now - cached.ts < LARGEST_ACCOUNTS_TTL_MS)) {
+    return cached.data;
+  }
+
+  let tries = 0;
+
+  while (tries < 4) {
+    try {
+      const res = await axios.post(HELIUS_RPC_URL, {
+        jsonrpc: "2.0",
+        id: "largest-accounts",
+        method: "getTokenLargestAccounts",
+        params: [mint]
+      }, {
+        timeout: 15000
+      });
+
+      const data = res.data?.result?.value || [];
+      largestAccountsCache.set(mint, { ts: now, data });
+      return data;
+    } catch (err) {
+      const status = err?.response?.status;
+
+      if (status === 429) {
+        tries += 1;
+        await sleep(1500 * tries);
+        continue;
+      }
+
+      throw err;
+    }
+  }
+
+  return null;
+}
 function nowTs() {
   return Math.floor(Date.now() / 1000);
 }
@@ -1072,23 +1113,40 @@ async function fetchTokenProfileImage(chainId, tokenAddress, fallbackPair = null
 }
 
 // ================= CHAIN INTELLIGENCE =================
-async function fetchHeliusTokenLargestAccounts(mintAddress) {
-  if (!hasHelius() || !mintAddress) return [];
-  try {
-    const rpcUrl = `https://mainnet.helius-rpc.com/?api-key=${encodeURIComponent(HELIUS_API_KEY)}`;
-    const data = await retryOperation(
-      "fetchHeliusTokenLargestAccounts",
-      async () => {
-        const out = await rpcPost(rpcUrl, {
-          jsonrpc: "2.0",
-          id: "gork-largest-accounts",
-          method: "getTokenLargestAccounts",
-          params: [mintAddress]
-        });
-        if (!Array.isArray(out?.result?.value)) {
-          throw new Error("Largest accounts payload missing");
-        }
-        return out;
+function sleep(ms) {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
+async function fetchHeliusTokenLargestAccounts(mint) {
+  let tries = 0;
+
+  while (tries < 4) {
+    try {
+      const res = await axios.post(HELIUS_RPC_URL, {
+        jsonrpc: "2.0",
+        id: "largest-accounts",
+        method: "getTokenLargestAccounts",
+        params: [mint]
+      }, {
+        timeout: 15000
+      });
+
+      return res.data?.result?.value || [];
+    } catch (err) {
+      const status = err?.response?.status;
+
+      if (status === 429) {
+        tries += 1;
+        console.warn(`Helius 429 on largest accounts for ${mint}. Retry ${tries}/4`);
+        await sleep(1500 * tries);
+        continue;
+      }
+
+      throw err;
+    }
+  }
+
+  console.warn(`Helius largest accounts skipped for ${mint} after retries`);
+  return null;
       },
       {
         attempts: 2,
@@ -1122,7 +1180,11 @@ async function fetchEvmHoneypot(address, chainId) {
   if (!address || !isEvmChain(chainId)) return null;
   const chain = String(chainId).toLowerCase();
   const mappedChainId = EVM_CHAIN_IDS[chain];
+const largestAccounts = await fetchHeliusTokenLargestAccounts(mint);
 
+if (!largestAccounts) {
+  lines.push("• Holder concentration: temporarily unavailable");
+}
   const strategies = [
     async () => {
       const res = await axios.get(`${HONEYPOT_API_BASE}/v2/IsHoneypot`, {
