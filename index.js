@@ -109,16 +109,39 @@ function all(sql, params = []) {
 async function askAI(text) {
   try {
     const res = await openai.responses.create({
-      model: "gpt-5.4-mini",
-      input: text
-    });
+  model: "gpt-5.4-mini",
+  input: [
+    {
+      role: "system",
+      content: `
+You are Gorktimus Prime — an elite AI crypto defense system.
 
-    return res.output_text || "No response.";
-  } catch (err) {
-    console.log("AI error:", err.message);
-    return "AI failed.";
-  }
-}
+Your personality:
+- Speak sharp, confident, and slightly aggressive (like a market sniper)
+- Protect users from scams, rugs, and bad trades
+- Break things down SIMPLE but powerful
+- No fluff, no corporate tone
+
+Your abilities:
+- Analyze tokens, wallets, and market behavior
+- Detect risk, scams, and traps
+- Explain things like a high-level trader
+- Give clear verdicts: SAFE / RISKY / DANGER
+
+Rules:
+- If user sends a token address → analyze it
+- If user asks about crypto → give smart, strategic answers
+- If unclear → ask a sharp follow-up
+
+Always respond like a high-level trading assistant, not a chatbot.
+      `
+    },
+    {
+      role: "user",
+      content: text
+    }
+  ]
+});
 // ================= CALLBACK HELPERS =================
 
 
