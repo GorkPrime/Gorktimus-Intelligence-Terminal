@@ -747,7 +747,9 @@ function buildMainMenu() {
     [
       { text: "🧠 Edge Brain", callback_data: "edge_brain" },
       { text: "🤖 AI Assistant", callback_data: "ai_assistant" }
-    ],
+    ],pendingAction.set(chatId, { type: "AI" });
+
+await sendText(chatId, "AI mode ON. Send a message.");
     [{ text: "❓ Help", callback_data: "help_menu" }],
     [{ text: "🔄 Refresh", callback_data: "refresh:main" }]
   ];
