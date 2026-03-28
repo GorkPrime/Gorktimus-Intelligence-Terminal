@@ -109,7 +109,7 @@ function all(sql, params = []) {
 async function askAI(text) {
   try {
     const res = await openai.chat.completions.create({
-      model: "gpt-4-mini",
+      model: "gpt-5.4-mini",
       messages: [
         {
           role: "system",
