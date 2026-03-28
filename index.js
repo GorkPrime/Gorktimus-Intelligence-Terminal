@@ -317,7 +317,7 @@ async function initDb() {
     }
   }
 
-  return null;
+ return []; 
 }
 function nowTs() {
   return Math.floor(Date.now() / 1000);
@@ -1549,16 +1549,17 @@ async function buildRiskVerdict(pair, userId = null) {
 
   if (chain === "solana") {
     const largestAccounts = await fetchHeliusTokenLargestAccounts(pair.baseAddress);
-    const holderInfo = analyzeSolanaHolderConcentration(largestAccounts);
-
+    
+   const holderInfo = analyzeSolanaHolderConcentration(safeLargestAccounts);
+const safeLargestAccounts = Array.isArray(largestAccounts) ? largestAccounts : [];
     holderLabel = holderInfo.label;
     holderScore = holderInfo.score;
     holderDetail = holderInfo.detail;
     holderTop5Pct = holderInfo.top5Pct;
 
-    transparencyLabel = largestAccounts.length ? "Some Signal" : "Limited";
-    transparencyScore = largestAccounts.length ? 10 : 5;
-    transparencyDetail = largestAccounts.length
+   transparencyLabel = safeLargestAccounts.length ? "Some Signal" : "Limited";
+transparencyScore = safeLargestAccounts.length ? 10 : 5;
+  transparencyDetail = safeLargestAccounts.length
       ? "Largest accounts returned from Helius."
       : "No extra holder structure returned.";
 
@@ -1568,7 +1569,7 @@ async function buildRiskVerdict(pair, userId = null) {
       "Solana honeypot simulation is limited in this stack, so safety is inferred more from structure.";
 
     sourceChecks = {
-      available: 1 + (largestAccounts.length ? 1 : 0) + 1,
+     available: 1 + (safeLargestAccounts.length ? 1 : 0) + 1,
       expected: 3
     };
   } else if (isEvmChain(chain)) {
@@ -2514,7 +2515,8 @@ bot.on("message", async (msg) => {
       await runTokenScan(chatId, cleaned, msg.from.id);
     }
   } catch (err) {
-    console.log("message handler error:", err.message);
+  console.log("message handler error:", err.message);
+console.log(err.stack);
   }
 });
 
