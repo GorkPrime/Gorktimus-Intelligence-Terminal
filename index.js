@@ -1067,7 +1067,7 @@ async function resolveTokenToBestPair(chainId, tokenAddress, forceFresh = false)
       const pairs = await searchDexPairs(q);
       if (!pairs.length) {
         result = null;
-        break;
+       
       }
 
       const lowered = q.toLowerCase();
@@ -1078,7 +1078,7 @@ async function resolveTokenToBestPair(chainId, tokenAddress, forceFresh = false)
         return rankPairQuality(b) - rankPairQuality(a);
       })[0];
 
-      break;
+   
     } catch (err) {
       const status = err?.response?.status;
 
