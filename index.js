@@ -1546,33 +1546,33 @@ async function buildRiskVerdict(pair, userId = null) {
   let sourceChecks = { available: 1, expected: 3 };
 
   const chain = String(pair.chainId || "").toLowerCase();
+if (chain === "solana") {
+  const largestAccounts = await fetchHeliusTokenLargestAccounts(pair.baseAddress);
+  const safeLargestAccounts = Array.isArray(largestAccounts) ? largestAccounts : [];
+  const holderInfo = analyzeSolanaHolderConcentration(safeLargestAccounts);
 
-  if (chain === "solana") {
-    const largestAccounts = await fetchHeliusTokenLargestAccounts(pair.baseAddress);
-    
-   const holderInfo = analyzeSolanaHolderConcentration(safeLargestAccounts);
-const safeLargestAccounts = Array.isArray(largestAccounts) ? largestAccounts : [];
-    holderLabel = holderInfo.label;
-    holderScore = holderInfo.score;
-    holderDetail = holderInfo.detail;
-    holderTop5Pct = holderInfo.top5Pct;
+  holderLabel = holderInfo.label;
+  holderScore = holderInfo.score;
+  holderDetail = holderInfo.detail;
+  holderTop5Pct = holderInfo.top5Pct;
 
-   transparencyLabel = safeLargestAccounts.length ? "Some Signal" : "Limited";
-transparencyScore = safeLargestAccounts.length ? 10 : 5;
+  transparencyLabel = safeLargestAccounts.length ? "Some Signal" : "Limited";
+  transparencyScore = safeLargestAccounts.length ? 10 : 5;
   transparencyDetail = safeLargestAccounts.length
-      ? "Largest accounts returned from Helius."
-      : "No extra holder structure returned.";
+    ? "Largest accounts returned from Helius."
+    : "No extra holder structure returned.";
 
-    honeypotLabel = "Not Fully Testable";
-    honeypotScore = 8;
-    honeypotDetail =
-      "Solana honeypot simulation is limited in this stack, so safety is inferred more from structure.";
+  honeypotLabel = "Not Fully Testable";
+  honeypotScore = 8;
+  honeypotDetail =
+    "Solana honeypot simulation is limited in this stack, so safety is inferred more from structure.";
 
-    sourceChecks = {
-     available: 1 + (safeLargestAccounts.length ? 1 : 0) + 1,
-      expected: 3
-    };
-  } else if (isEvmChain(chain)) {
+  sourceChecks = {
+    available: 1 + (safeLargestAccounts.length ? 1 : 0) + 1,
+    expected: 3
+  };
+}
+  else if (isEvmChain(chain)) {
     const [honeypotData, topHoldersData, etherscanData] = await Promise.all([
       fetchEvmHoneypot(pair.baseAddress, chain),
       fetchEvmTopHolders(pair.baseAddress, chain),
