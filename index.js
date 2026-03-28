@@ -147,9 +147,9 @@ Never speak like generic AI.
           content: text
         }
       ]
-    });
+    }); 
 
-    return `⚡ <b>GORKTIMUS VERDICT</b>\n\n${res.choices[0].message.content}`;
+    return `⚡ GORKTIMUS VERDICT\n\n${res.choices[0].message.content}`;
 
   } catch (err) {
     console.log("AI ERROR:", err?.message);
@@ -1924,7 +1924,195 @@ async function promptScanToken(chatId) {
     buildMainMenuOnlyButton("scan_token")
   );
 }
+// ================= SMART INPUT HELPERS =================
 
+function extractFirstUrl(text) {
+  const match = String(text || "").match(/https?:\/\/[^\s]+/i);
+  return match ? match[0] : "";
+}
+
+function extractAddressCandidates(text) {
+  const matches = String(text || "").match(/0x[a-fA-F0-9]{40}|[1-9A-HJ-NP-Za-km-z]{32,44}/g);
+  return matches ? [...new Set(matches)] : [];
+}
+
+function detectChainFromInput(text) {
+  const value = String(text || "").trim();
+  const lower = value.toLowerCase();
+
+  if (/^0x[a-fA-F0-9]{40}$/.test(value)) {
+    return "evm";
+  }
+
+  if (/^[1-9A-HJ-NP-Za-km-z]{32,44}$/.test(value)) {
+    return "solana";
+  }
+
+  if (lower.includes("geckoterminal.com/base") || lower.includes("dexscreener.com/base")) {
+    return "base";
+  }
+
+  if (lower.includes("geckoterminal.com/eth") || lower.includes("dexscreener.com/ethereum")) {
+    return "ethereum";
+  }
+
+  if (lower.includes("geckoterminal.com/solana") || lower.includes("dexscreener.com/solana")) {
+    return "solana";
+  }
+
+  if (lower.includes("birdeye.so") && lower.includes("chain=solana")) {
+    return "solana";
+  }
+
+  if (lower.includes("birdeye.so") && lower.includes("chain=ethereum")) {
+    return "ethereum";
+  }
+
+  if (lower.includes("birdeye.so") && lower.includes("chain=base")) {
+    return "base";
+  }
+
+  return "unknown";
+}
+
+function parseDexUrl(text) {
+  const rawUrl = extractFirstUrl(text);
+  if (!rawUrl) return null;
+
+  try {
+    const url = new URL(rawUrl);
+    const hostname = url.hostname.toLowerCase();
+    const pathname = url.pathname.replace(/^\/+|\/+$/g, "");
+    const pathParts = pathname.split("/").filter(Boolean);
+    const searchParams = url.searchParams;
+
+    // DexScreener: /{chain}/{address}
+    if (hostname.includes("dexscreener.com") && pathParts.length >= 2) {
+      return {
+        source: "dexscreener",
+        chainId: String(pathParts[0] || "").toLowerCase(),
+        address: String(pathParts[1] || "").trim(),
+        inputType: "pair_or_token_url"
+      };
+    }
+
+    // GeckoTerminal: /{chain}/pools/{address}
+    if (
+      hostname.includes("geckoterminal.com") &&
+      pathParts.length >= 3 &&
+      String(pathParts[1]).toLowerCase() === "pools"
+    ) {
+      let chainId = String(pathParts[0] || "").toLowerCase();
+      if (chainId === "eth") chainId = "ethereum";
+
+      return {
+        source: "geckoterminal",
+        chainId,
+        address: String(pathParts[2] || "").trim(),
+        inputType: "pair_url"
+      };
+    }
+
+    // BirdEye: /token/{address}?chain=solana
+    if (
+      hostname.includes("birdeye.so") &&
+      pathParts.length >= 2 &&
+      String(pathParts[0]).toLowerCase() === "token"
+    ) {
+      return {
+        source: "birdeye",
+        chainId: String(searchParams.get("chain") || "unknown").toLowerCase(),
+        address: String(pathParts[1] || "").trim(),
+        inputType: "token_url"
+      };
+    }
+
+    return {
+      source: "url",
+      chainId: detectChainFromInput(rawUrl),
+      address: "",
+      inputType: "url"
+    };
+  } catch (_) {
+    return null;
+  }
+}
+
+function detectInputType(text) {
+  const raw = String(text || "").trim();
+  const lower = raw.toLowerCase();
+
+  if (!raw) {
+    return {
+      type: "unknown",
+      chainHint: "unknown",
+      value: raw
+    };
+  }
+
+  const parsedUrl = parseDexUrl(raw);
+  if (parsedUrl) {
+    return {
+      type: parsedUrl.inputType,
+      chainHint: parsedUrl.chainId || "unknown",
+      value: parsedUrl.address || raw,
+      meta: parsedUrl
+    };
+  }
+
+  if (/^0x[a-fA-F0-9]{40}$/.test(raw)) {
+    return {
+      type: "evm_address",
+      chainHint: "evm",
+      value: raw
+    };
+  }
+
+  if (/^[1-9A-HJ-NP-Za-km-z]{32,44}$/.test(raw)) {
+    return {
+      type: "solana_address",
+      chainHint: "solana",
+      value: raw
+    };
+  }
+
+  const addresses = extractAddressCandidates(raw);
+  if (addresses.length === 1) {
+    const addr = addresses[0];
+    return {
+      type: addr.startsWith("0x") ? "evm_address" : "solana_address",
+      chainHint: addr.startsWith("0x") ? "evm" : "solana",
+      value: addr
+    };
+  }
+
+  const questionWords = [
+    "what", "why", "how", "is", "can", "should",
+    "explain", "compare", "analyze", "check", "tell"
+  ];
+
+  if (questionWords.some(word => lower.startsWith(word + " "))) {
+    return {
+      type: "question",
+      chainHint: "unknown",
+      value: raw
+    };
+  }
+
+  if (/^[A-Za-z0-9_.$-]{2,24}$/.test(raw) && !raw.startsWith("/")) {
+    return {
+      type: "ticker",
+      chainHint: "unknown",
+      value: raw
+    };
+  }
+
+  return {
+    type: "text",
+    chainHint: detectChainFromInput(raw),
+    value: raw
+  };
+}
 async function runTokenScan(chatId, query, userId = null) {
   const pair = await resolveBestPair(query,false);
 
