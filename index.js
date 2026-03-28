@@ -1879,7 +1879,9 @@ async function showMainMenu(chatId) {
   const pulse = await getNetworkPulse();
   await sendMenu(
     chatId,
-   `🧠 <b>Gorktimus Intelligence Terminal</b> ${getDevModeStatus()}\n\n${pulse}\n\nLive intelligence. On-demand execution.\nNo clutter. No spam.\n\nSelect an operation below.`,
+    `🧠 <b>Gorktimus Intelligence Terminal</b> ${getDevModeStatus()}\n\n${pulse}\n\nLive intelligence. On-demand execution.\nNo clutter. No spam.\n\nSelect an operation below.`,
+    buildMainMenu()
+  );
 }
 
 async function showHelpMenu(chatId) {
