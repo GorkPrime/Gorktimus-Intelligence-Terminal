@@ -68,6 +68,9 @@ const bot = new TelegramBot(BOT_TOKEN, { polling: true });
 const pendingAction = new Map();
 let BOT_USERNAME = "";
 const callbackStore = new Map();
+
+// ================= DEV MODE LOCK =================
+const OWNER_USER_ID = process.env.OWNER_USER_ID || "YOUR_TELEGRAM_ID_HERE";
 // ================= DB HELPERS =================
 function makeShortCallback(action, payload) {
   const id = Math.random().toString(36).slice(2, 10);
@@ -2216,6 +2219,12 @@ async function handleRefresh(chatId, userId, key) {
 // ================= COMMANDS =================
 bot.onText(/\/start/, async (msg) => {
   try {
+    // Dev mode: only owner can use
+    if (String(msg.from?.id) !== OWNER_USER_ID) {
+      await sendText(msg.chat.id, "🚫 This bot is in development mode. Access denied.");
+      return;
+    }
+
     const ok = await ensureSubscribedOrBlock(msg);
     await upsertUserFromMessage(msg, ok ? 1 : 0);
     await ensureUserSettings(msg.from.id);
@@ -2225,6 +2234,7 @@ bot.onText(/\/start/, async (msg) => {
   } catch (err) {
     console.log("/start error:", err.message);
   }
+});
 });
 
 // ================= MESSAGE HANDLER =================
