@@ -2245,7 +2245,7 @@ if (pending?.type === "AI") {
   const isToken = cleaned.length > 30 && !cleaned.includes(" ");
 
   if (isToken) {
-    const scan = await scanToken(cleaned);
+    const scan = await runTokenScan(cleaned);
     return sendText(chatId, scan, buildAIAssistantMenu());
   }
 
