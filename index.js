@@ -747,9 +747,7 @@ function buildMainMenu() {
     [
       { text: "🧠 Edge Brain", callback_data: "edge_brain" },
       { text: "🤖 AI Assistant", callback_data: "ai_assistant" }
-    ],pendingAction.set(chatId, { type: "AI" });
-
-await sendText(chatId, "AI mode ON. Send a message.");
+    ],
     [{ text: "❓ Help", callback_data: "help_menu" }],
     [{ text: "🔄 Refresh", callback_data: "refresh:main" }]
   ];
@@ -2208,7 +2206,15 @@ bot.on("message", async (msg) => {
     if (!msg?.from?.id || !msg?.chat?.id) return;
     
     if (msg.text && msg.text.startsWith("/start")) return;
+const mode = pendingAction.get(chatId);
 
+if (mode?.type === "AI") {
+  const reply = await askAI(text);
+
+  await sendText(chatId, reply, buildAIAssistantMenu());
+
+  return;
+}
     const ok = await ensureSubscribedOrBlock(msg);
     await upsertUserFromMessage(msg, ok ? 1 : 0);
     await ensureUserSettings(msg.from.id);
@@ -2321,7 +2327,11 @@ if (data.startsWith("watch_rescan:")) {
     if (data === "whale_menu") return showWhaleMenu(chatId);
     if (data === "invite_friends") return showInviteFriends(chatId);
     if (data === "check_subscription") return showMainMenu(chatId);
+pendingAction.set(chatId, { type: "AI" });
 
+await sendText(chatId, "AI mode ON. Send a message.", buildAIAssistantMenu());
+
+return;
    if (data === "help_engine") {
   return sendText(
     chatId,
