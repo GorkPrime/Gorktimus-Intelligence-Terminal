@@ -1,5 +1,11 @@
 const TelegramBot = require("node-telegram-bot-api");
 const axios = require("axios");
+
+const OpenAI = require("openai");
+
+const openai = new OpenAI({
+  apiKey: process.env.OPENAI_API_KEY
+});
 const pairCache = new Map();
 
 function sleep(ms) {
@@ -99,6 +105,19 @@ function all(sql, params = []) {
       else resolve(rows);
     });
   });
+}
+async function askAI(text) {
+  try {
+    const res = await openai.responses.create({
+      model: "gpt-5.4-mini",
+      input: text
+    });
+
+    return res.output_text || "No response.";
+  } catch (err) {
+    console.log("AI error:", err.message);
+    return "AI failed.";
+  }
 }
 // ================= CALLBACK HELPERS =================
 
