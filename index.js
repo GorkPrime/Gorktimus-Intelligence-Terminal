@@ -2205,23 +2205,14 @@ bot.onText(/\/start/, async (msg) => {
   }
 });
 
-// ================= MESSAGE FLOW =================
+// ================= MESSAGE HANDLER =================
 bot.on("message", async (msg) => {
   try {
     if (!isPrivateChat(msg)) return;
     if (!msg?.from?.id || !msg?.chat?.id) return;
     
     if (msg.text && msg.text.startsWith("/start")) return;
-const mode = pendingAction.get(chatId);
-
-if (mode?.type === "AI") {
-  const reply = await askAI(text);
-
-  await sendText(chatId, reply, buildAIAssistantMenu());
-
-  return;
-}
-    const ok = await ensureSubscribedOrBlock(msg);
+OrBlock(msg);
     await upsertUserFromMessage(msg, ok ? 1 : 0);
     await ensureUserSettings(msg.from.id);
     await trackUserActivity(msg.from.id);
