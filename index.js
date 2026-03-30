@@ -1016,6 +1016,9 @@ async function showMyPlan(chatId, userId) {
   );
 }
 async function showFoundingInfo(chatId,userid) {
+ if (!isOwnerUser(userId)) {
+  return sendText(chatId, "🚫 Not available.");
+} 
   await sendText(
     chatId,
     `💠 <b>Founding Access</b>\n\n` +
@@ -1033,9 +1036,7 @@ async function showFoundingInfo(chatId,userid) {
     }
   );
 }
-if (!isOwnerUser(userId)) {
-  return sendText(chatId, "🚫 Not available.");
-}
+
 // ================= MENUS =================
 function getDevModeStatus() {
   const isDev = process.env.NODE_ENV === 'development';
