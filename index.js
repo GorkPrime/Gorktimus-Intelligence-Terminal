@@ -61,24 +61,6 @@ const EVM_CHAIN_IDS = {
 };
 
 // ================= GLOBALS =================
-const PLAN_FREE = "free";
-const PLAN_FOUNDING = "founding";
-const PLAN_PREMIUM = "premium";
-const PLAN_LEADERSHIP = "leadership";
-const PLAN_OWNER = "owner";
-
-const FOUNDING_PRICE_CENTS = 500; // $5
-const PREMIUM_PRICE_CENTS = 1200; // future standard example
-const FOUNDING_LOCK_DAYS = 30;    // early deal window if you want to use it
-
-const PLAN_PRIORITY = {
-  free: 1,
-  founding: 2,
-  premium: 3,
-  leadership: 4,
-  owner: 5
-};
-
 const largestAccountsCache = new Map();
 const LARGEST_ACCOUNTS_TTL_MS = 60000;
 const db = new sqlite3.Database(DB_PATH);
@@ -89,10 +71,6 @@ const callbackStore = new Map();
 
 // ================= DEV MODE LOCK =================
 const OWNER_USER_ID = process.env.OWNER_USER_ID || "";
-function isOwnerUser(userId) {
-  return String(userId) === String(OWNER_USER_ID);
-}
-
 // ================= DB HELPERS =================
 function makeShortCallback(action, payload) {
   const id = Math.random().toString(36).slice(2, 10);
@@ -296,30 +274,6 @@ async function initDb() {
 
   try {
     await run(`ALTER TABLE user_settings ADD COLUMN last_scan_query TEXT DEFAULT ''`);
-  } catch (_) {}
-
-   try {
-    await run(`ALTER TABLE users ADD COLUMN plan_tier TEXT DEFAULT 'free'`);
-  } catch (_) {}
-
-  try {
-    await run(`ALTER TABLE users ADD COLUMN plan_status TEXT DEFAULT 'active'`);
-  } catch (_) {}
-
-  try {
-    await run(`ALTER TABLE users ADD COLUMN plan_expires_at INTEGER DEFAULT 0`);
-  } catch (_) {}
-
-  try {
-    await run(`ALTER TABLE users ADD COLUMN founding_price_cents INTEGER DEFAULT 0`);
-  } catch (_) {}
-
-  try {
-    await run(`ALTER TABLE users ADD COLUMN price_locked INTEGER DEFAULT 0`);
-  } catch (_) {}
-
-  try {
-    await run(`ALTER TABLE users ADD COLUMN early_access INTEGER DEFAULT 0`);
   } catch (_) {}
 }
 
@@ -656,23 +610,8 @@ async function upsertUserFromMessage(msg, isSubscribed = 0) {
 
   await run(
     `
-    INSERT INTO users (
-      user_id,
-      chat_id,
-      username,
-      first_name,
-      last_name,
-      is_subscribed,
-      plan_tier,
-      plan_status,
-      plan_expires_at,
-      founding_price_cents,
-      price_locked,
-      early_access,
-      created_at,
-      updated_at
-    )
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    INSERT INTO users (user_id, chat_id, username, first_name, last_name, is_subscribed, created_at, updated_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
     ON CONFLICT(user_id) DO UPDATE SET
       chat_id = excluded.chat_id,
       username = excluded.username,
@@ -681,22 +620,7 @@ async function upsertUserFromMessage(msg, isSubscribed = 0) {
       is_subscribed = excluded.is_subscribed,
       updated_at = excluded.updated_at
     `,
-    [
-      userId,
-      chatId,
-      username,
-      firstName,
-      lastName,
-      isSubscribed ? 1 : 0,
-      PLAN_FREE,
-      "active",
-      0,
-      0,
-      0,
-      0,
-      ts,
-      ts
-    ]
+    [userId, chatId, username, firstName, lastName, isSubscribed ? 1 : 0, ts, ts]
   );
 }
 
@@ -791,123 +715,7 @@ async function getNetworkPulse() {
 
   return `⚡ ${todayUsers?.c || 0} today • ${liveUsers?.c || 0} live • ${scansToday?.c || 0} scans`;
 }
-async function getUserRecord(userId) {
-  return await get(`SELECT * FROM users WHERE user_id = ?`, [String(userId)]);
-}
 
-async function ensureUserRecord(msg, isSubscribed = 0) {
-  await upsertUserFromMessage(msg, isSubscribed);
-  return await getUserRecord(msg.from?.id);
-}
-
-function normalizePlanTier(plan) {
-  const p = String(plan || "").toLowerCase();
-  if ([PLAN_FREE, PLAN_FOUNDING, PLAN_PREMIUM, PLAN_LEADERSHIP, PLAN_OWNER].includes(p)) {
-    return p;
-  }
-  return PLAN_FREE;
-}
-
-async function getUserPlanTier(userId) {
-  const row = await getUserRecord(userId);
-  return normalizePlanTier(row?.plan_tier);
-}
-
-async function setUserPlan(userId, planTier, options = {}) {
-  const tier = normalizePlanTier(planTier);
-  const ts = nowTs();
-
-  const {
-    expiresAt = 0,
-    foundingPriceCents = 0,
-    priceLocked = 0,
-    earlyAccess = 0,
-    planStatus = "active"
-  } = options;
-
-  await run(
-    `
-    UPDATE users
-    SET plan_tier = ?,
-        plan_status = ?,
-        plan_expires_at = ?,
-        founding_price_cents = ?,
-        price_locked = ?,
-        early_access = ?,
-        updated_at = ?
-    WHERE user_id = ?
-    `,
-    [
-      tier,
-      planStatus,
-      Number(expiresAt || 0),
-      Number(foundingPriceCents || 0),
-      Number(priceLocked || 0),
-      Number(earlyAccess || 0),
-      ts,
-      String(userId)
-    ]
-  );
-}
-
-async function isLeadershipAccess(userId) {
-  const tier = await getUserPlanTier(userId);
-  return tier === PLAN_LEADERSHIP || tier === PLAN_OWNER;
-}
-
-async function hasPremiumAccess(userId) {
-  const tier = await getUserPlanTier(userId);
-  return [PLAN_FOUNDING, PLAN_PREMIUM, PLAN_LEADERSHIP, PLAN_OWNER].includes(tier);
-}
-
-async function getUserAccessProfile(userId) {
-  const row = await getUserRecord(userId);
-  const tier = normalizePlanTier(row?.plan_tier);
-
-  const premiumLike = [PLAN_FOUNDING, PLAN_PREMIUM, PLAN_LEADERSHIP, PLAN_OWNER].includes(tier);
-  const leadershipLike = [PLAN_LEADERSHIP, PLAN_OWNER].includes(tier);
-
-  return {
-    tier,
-    isPremiumLike: premiumLike,
-    isLeadershipLike: leadershipLike,
-    priority: PLAN_PRIORITY[tier] || 1,
-    canUsePremiumLane: premiumLike,
-    canUseLeadershipLane: leadershipLike,
-    priceLocked: Number(row?.price_locked || 0) === 1,
-    foundingPriceCents: Number(row?.founding_price_cents || 0),
-    earlyAccess: Number(row?.early_access || 0) === 1,
-    expiresAt: Number(row?.plan_expires_at || 0)
-  };
-}
-async function getTierPolicy(userId) {
-  const access = await getUserAccessProfile(userId);
-
-  if (access.tier === PLAN_OWNER || access.tier === PLAN_LEADERSHIP) {
-    return {
-      priority: 4,
-      pairCacheMs: 5000,
-      latestCacheMs: 5000,
-      canForceFreshMenus: true
-    };
-  }
-
-  if (access.tier === PLAN_PREMIUM || access.tier === PLAN_FOUNDING) {
-    return {
-      priority: 3,
-      pairCacheMs: 8000,
-      latestCacheMs: 8000,
-      canForceFreshMenus: false
-    };
-  }
-
-  return {
-    priority: 1,
-    pairCacheMs: 20000,
-    latestCacheMs: 20000,
-    canForceFreshMenus: false
-  };
-}
 // ================= SUBSCRIPTION =================
 async function isUserSubscribed(userId) {
   if (!REQUIRED_CHANNEL) return true;
@@ -954,88 +762,6 @@ async function ensureSubscribedOrBlock(msgOrQuery) {
   }
   return true;
 }
-function centsToUsd(cents) {
-  return `$${(Number(cents || 0) / 100).toFixed(2)}`;
-}
-async function requirePremiumAccess(chatId, userId) {
-  const access = await getUserAccessProfile(userId);
-
-  if (access.isPremiumLike) return true;
-
-  await sendText(
-    chatId,
-    `💠 <b>Premium Feature</b>\n\nThis lane is reserved for founding, premium, and leadership access.`,
-    {
-      reply_markup: {
-        inline_keyboard: [
-        ...(isOwnerUser(userId)
-  ? [{ text: "🎟 Founding Access", callback_data: "founding_info" }]
-  : [])
-          [{ text: "🏠 Main Menu", callback_data: "main_menu" }]
-        ]
-      }
-    }
-  );
-
-  return false;
-}
-
-async function showMyPlan(chatId, userId) {
-  const access = await getUserAccessProfile(userId);
-
-  let priceLine = "No paid access yet.";
-  if (access.foundingPriceCents > 0) {
-    priceLine = `Locked price: <b>${centsToUsd(access.foundingPriceCents)}</b>`;
-  } else if (access.tier === PLAN_PREMIUM) {
-    priceLine = `Standard premium tier active.`;
-  }
-
-  let perks = "Standard access.";
-  if (access.isPremiumLike) {
-    perks = "Priority routing • fresher data windows • premium lane ready";
-  }
-  if (access.isLeadershipLike) {
-    perks = "Leadership access • full lane priority • no charge";
-  }
-
-  await sendText(
-    chatId,
-    `🧠 <b>Access Profile</b>\n\n` +
-    `Tier: <b>${escapeHtml(access.tier)}</b>\n` +
-    `Priority: <b>${access.priority}</b>\n` +
-    `Price lock: <b>${access.priceLocked ? "YES" : "NO"}</b>\n` +
-    `${priceLine}\n\n` +
-    `Perks: ${escapeHtml(perks)}`,
-    {
-      reply_markup: {
-        inline_keyboard: [
-          [{ text: "🏠 Main Menu", callback_data: "main_menu" }]
-        ]
-      }
-    }
-  );
-}
-async function showFoundingInfo(chatId,userid) {
- if (!isOwnerUser(userId)) {
-  return sendText(chatId, "🚫 Not available.");
-} 
-  await sendText(
-    chatId,
-    `💠 <b>Founding Access</b>\n\n` +
-    `Early users can be manually upgraded into the founding tier.\n\n` +
-    `Current founding price target: <b>${centsToUsd(FOUNDING_PRICE_CENTS)}</b>\n` +
-    `Future premium target: <b>${centsToUsd(PREMIUM_PRICE_CENTS)}</b>\n\n` +
-    `Founding users can later be price-locked as early supporters.`,
-    {
-      reply_markup: {
-        inline_keyboard: [
-          [{ text: "💠 My Plan", callback_data: "my_plan" }],
-          [{ text: "🏠 Main Menu", callback_data: "main_menu" }]
-        ]
-      }
-    }
-  );
-}
 
 // ================= MENUS =================
 function getDevModeStatus() {
@@ -1043,7 +769,7 @@ function getDevModeStatus() {
   return isDev ? `🔴 DEV: ON` : `🟢 PROD: ON`;
 }
 
-function buildMainMenu(userid) {
+function buildMainMenu() {
   const growthRow = BOT_USERNAME
     ? [{ text: "🚀 Invite Friends", callback_data: "invite_friends" }]
     : [];
@@ -1068,10 +794,6 @@ function buildMainMenu(userid) {
     [
       { text: "🧠 Edge Brain", callback_data: "edge_brain" },
       { text: "🤖 AI Assistant", callback_data: "ai_assistant" }
-    ],
-        [
-      { text: "💠 My Plan", callback_data: "my_plan" },
-      { text: "🎟 Founding Access", callback_data: "founding_info" }
     ],
     [{ text: "❓ Help", callback_data: "help_menu" }],
     [{ text: "🔄 Refresh", callback_data: "refresh:main" }]
@@ -2215,12 +1937,12 @@ function buildAssistantGenericReply(prompt = "") {
 }
 
 // ================= SCREENS =================
-async function showMainMenu(chatId,userid) {
+async function showMainMenu(chatId) {
   const pulse = await getNetworkPulse();
   await sendMenu(
     chatId,
     `🧠 <b>Gorktimus Intelligence Terminal</b> ${getDevModeStatus()}\n\n${pulse}\n\nLive intelligence. On-demand execution.\nNo clutter. No spam.\n\nSelect an operation below.`,
-    buildMainMenu(userid)
+    buildMainMenu()
   );
 }
 
@@ -2748,7 +2470,7 @@ async function handleWatchOpen(chatId, userId, chainId, tokenAddress) {
 }
 
 async function handleRefresh(chatId, userId, key) {
-  if (key === "main") return showMainMenu(chatId, userid);
+  if (key === "main") return showMainMenu(chatId);
   if (key === "help") return showHelpMenu(chatId);
   if (key === "trending") return showTrending(chatId, userId);
   if (key === "launch_radar") return showLaunchRadar(chatId);
@@ -2776,86 +2498,12 @@ bot.onText(/\/start/, async (msg) => {
     await ensureUserSettings(msg.from.id);
     await trackUserActivity(msg.from.id);
     if (!ok) return;
-    await showMainMenu(msg.chat.id, msg.from.id);
+    await showMainMenu(msg.chat.id);
   } catch (err) {
     console.log("/start error:", err.message);
   }
 });
-function isOwnerUser(userId) {
-  return String(userId) === String(OWNER_USER_ID);
-}
 
-bot.onText(/\/grantplan (.+)/, async (msg, match) => {
-  try {
-    if (!isOwnerUser(msg.from?.id)) {
-      return sendText(msg.chat.id, "🚫 Owner only.");
-    }
-
-    const raw = String(match?.[1] || "").trim();
-    const parts = raw.split(/\s+/);
-
-    const targetUserId = parts[0];
-    const tier = normalizePlanTier(parts[1] || "free");
-
-    if (!targetUserId) {
-      return sendText(msg.chat.id, "Usage: /grantplan USER_ID free|founding|premium|leadership|owner");
-    }
-
-    const options = {};
-
-    if (tier === PLAN_FOUNDING) {
-      options.foundingPriceCents = FOUNDING_PRICE_CENTS;
-      options.priceLocked = 1;
-      options.earlyAccess = 1;
-    }
-
-    if (tier === PLAN_LEADERSHIP || tier === PLAN_OWNER) {
-      options.priceLocked = 1;
-      options.earlyAccess = 1;
-    }
-
-    await setUserPlan(targetUserId, tier, options);
-
-    await sendText(
-      msg.chat.id,
-      `✅ Plan updated\n\nUser: <code>${escapeHtml(targetUserId)}</code>\nTier: <b>${escapeHtml(tier)}</b>`
-    );
-  } catch (err) {
-    console.log("/grantplan error:", err.message);
-    await sendText(msg.chat.id, "⚠️ Could not update plan.");
-  }
-});
-
-bot.onText(/\/planof (.+)/, async (msg, match) => {
-  try {
-    if (!isOwnerUser(msg.from?.id)) {
-      return sendText(msg.chat.id, "🚫 Owner only.");
-    }
-
-    const targetUserId = String(match?.[1] || "").trim();
-    if (!targetUserId) {
-      return sendText(msg.chat.id, "Usage: /planof USER_ID");
-    }
-
-    const row = await getUserRecord(targetUserId);
-    if (!row) {
-      return sendText(msg.chat.id, "User not found.");
-    }
-
-    await sendText(
-      msg.chat.id,
-      `🧠 <b>User Plan</b>\n\n` +
-      `User: <code>${escapeHtml(targetUserId)}</code>\n` +
-      `Tier: <b>${escapeHtml(row.plan_tier || "free")}</b>\n` +
-      `Status: <b>${escapeHtml(row.plan_status || "active")}</b>\n` +
-      `Locked: <b>${Number(row.price_locked || 0) ? "YES" : "NO"}</b>\n` +
-      `Founding Price: <b>${centsToUsd(row.founding_price_cents || 0)}</b>`
-    );
-  } catch (err) {
-    console.log("/planof error:", err.message);
-    await sendText(msg.chat.id, "⚠️ Could not read plan.");
-  }
-});
 // ================= MESSAGE HANDLER =================
 async function showAIAssistant(chatId) {
   pendingAction.set(chatId, { type: "AI" });
@@ -2871,7 +2519,7 @@ bot.on("message", async (msg) => {
     if (!isPrivateChat(msg)) return;
     if (!msg?.from?.id || !msg?.chat?.id) return;
     if (msg.text && msg.text.startsWith("/start")) return;
-runMigrations();
+
     const ok = await ensureSubscribedOrBlock(msg);
     await upsertUserFromMessage(msg, ok ? 1 : 0);
     await ensureUserSettings(msg.from.id);
@@ -2979,8 +2627,6 @@ bot.on("callback_query", async (query) => {
     if (data === "launch_radar") return showLaunchRadar(chatId);
     if (data === "prime_picks") return showPrimePicks(chatId);
     if (data === "watchlist") return showWatchlist(chatId);
-    if (data === "my_plan") return showMyPlan(chatId, userId);
-    if (data === "founding_info") return showFoundingInfo(chatId,userid);
     if (data === "mode_lab") return showModeLab(chatId, userId);
     if (data === "alert_center") return showAlertCenter(chatId, userId);
     if (data === "edge_brain") return showEdgeBrain(chatId);
@@ -3265,4 +2911,4 @@ process.on("SIGTERM", () => {
     db.close();
   } catch (_) {}
   process.exit(0);
-});
+}); 15
