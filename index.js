@@ -293,7 +293,7 @@ async function initDb() {
   try {
     await run(`ALTER TABLE user_settings ADD COLUMN last_scan_query TEXT DEFAULT ''`);
   } catch (_) {}
-}
+
    try {
     await run(`ALTER TABLE users ADD COLUMN plan_tier TEXT DEFAULT 'free'`);
   } catch (_) {}
