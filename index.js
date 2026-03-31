@@ -68,7 +68,18 @@ const bot = new TelegramBot(BOT_TOKEN, { polling: true });
 const pendingAction = new Map();
 let BOT_USERNAME = "";
 const callbackStore = new Map();
+const latestProfilesCache = {
+  ts: 0,
+  data: []
+};
 
+const latestBoostsCache = {
+  ts: 0,
+  data: []
+};
+
+const PROFILES_CACHE_TTL_MS = 120000; // 2 min
+const BOOSTS_CACHE_TTL_MS = 45000;    // 45 sec
 // ================= DEV MODE LOCK =================
 const OWNER_USER_ID = process.env.OWNER_USER_ID || "";
 // ================= DB HELPERS =================
@@ -1253,23 +1264,41 @@ async function resolveTokenToBestPair(chainId, tokenAddress, forceFresh = false)
     return null;
   }
 }
-async function fetchLatestProfiles() {
+async function fetchLatestProfiles(forceFresh = false) {
   try {
+    const now = Date.now();
+    if (!forceFresh && latestProfilesCache.data.length && (now - latestProfilesCache.ts < PROFILES_CACHE_TTL_MS)) {
+      return latestProfilesCache.data;
+    }
+
     const data = await safeGet("https://api.dexscreener.com/token-profiles/latest/v1");
-    return Array.isArray(data) ? data : [];
+    const clean = Array.isArray(data) ? data : [];
+
+    latestProfilesCache.ts = now;
+    latestProfilesCache.data = clean;
+    return clean;
   } catch (err) {
     console.log("fetchLatestProfiles error:", err.message);
-    return [];
+    return latestProfilesCache.data || [];
   }
 }
 
-async function fetchLatestBoosts() {
+async function fetchLatestBoosts(forceFresh = false) {
   try {
+    const now = Date.now();
+    if (!forceFresh && latestBoostsCache.data.length && (now - latestBoostsCache.ts < BOOSTS_CACHE_TTL_MS)) {
+      return latestBoostsCache.data;
+    }
+
     const data = await safeGet("https://api.dexscreener.com/token-boosts/latest/v1");
-    return Array.isArray(data) ? data : [];
+    const clean = Array.isArray(data) ? data : [];
+
+    latestBoostsCache.ts = now;
+    latestBoostsCache.data = clean;
+    return clean;
   } catch (err) {
     console.log("fetchLatestBoosts error:", err.message);
-    return [];
+    return latestBoostsCache.data || [];
   }
 }
 
@@ -2181,7 +2210,16 @@ async function runTokenScan(chatId, query, userId = null) {
     `🧠 <b>Gorktimus Intelligence Terminal</b>\n\n🔎 <b>Scanning</b>\n\nPulling live structure and risk data for <b>${escapeHtml(query)}</b>...`,
     buildMainMenuOnlyButton("scan_token")
   );
+const inputInfo = detectInputType(query);
 
+if (inputInfo.type === "ticker") {
+  await sendText(
+    chatId,
+    `🧠 <b>Gorktimus Intelligence Terminal</b>\n\n⚠️ <b>Ticker-only scan detected</b>\n\nMultiple coins can share the same ticker.\n\nFor an exact result, paste the <b>contract address</b> or DexScreener token link.`,
+    buildMainMenuOnlyButton("scan_token")
+  );
+  return;
+}
   const pair = await resolveBestPair(query, false);
 
   if (userId) {
