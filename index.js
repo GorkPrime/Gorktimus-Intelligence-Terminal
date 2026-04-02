@@ -2638,7 +2638,6 @@ if (hasPhoto) {
   imageUrl = await getTelegramPhotoUrl(msg.photo);
 }
 if (!cleaned && !hasPhoto) return;
-let imageUrl = null;
 
 
     const pending = pendingAction.get(chatId);
