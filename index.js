@@ -66,6 +66,7 @@ const LARGEST_ACCOUNTS_TTL_MS = 60000;
 const db = new sqlite3.Database(DB_PATH);
 const bot = new TelegramBot(BOT_TOKEN, { polling: true });
 const pendingAction = new Map();
+const sessionMemory = new Map();
 let BOT_USERNAME = "";
 const callbackStore = new Map();
 const latestProfilesCache = {
@@ -83,6 +84,25 @@ const BOOSTS_CACHE_TTL_MS = 45000;    // 45 sec
 // ================= DEV MODE LOCK =================
 const OWNER_USER_ID = process.env.OWNER_USER_ID || "";
 // ================= DB HELPERS =================
+function getSessionMemory(chatId) {
+  if (!sessionMemory.has(chatId)) {
+    sessionMemory.set(chatId, {
+      lastScan: null,
+      lastImage: null,
+      lastAIContext: null
+    });
+  }
+  return sessionMemory.get(chatId);
+}
+
+function updateSessionMemory(chatId, patch) {
+  const current = getSessionMemory(chatId);
+  sessionMemory.set(chatId, {
+    ...current,
+    ...patch
+  });
+}
+
 function makeShortCallback(action, payload) {
   const id = Math.random().toString(36).slice(2, 10);
   callbackStore.set(id, payload);
@@ -120,7 +140,34 @@ function all(sql, params = []) {
     });
   });
 }
-async function askAI(text) {
+async function askAI({ text, chatId, imageUrl = null }) {
+  const memory = getSessionMemory(chatId);
+
+  let context = "";
+  if (memory?.lastScan) {
+    context = `
+Most recent scan context:
+- Query: ${memory.lastScan.query || ""}
+- Symbol: ${memory.lastScan.symbol || ""}
+- Name: ${memory.lastScan.name || ""}
+- Token Address: ${memory.lastScan.tokenAddress || ""}
+- Chain: ${memory.lastScan.chainId || ""}
+- Price: ${memory.lastScan.priceUsd || ""}
+- Liquidity: ${memory.lastScan.liquidityUsd || ""}
+- Market Cap: ${memory.lastScan.marketCap || ""}
+- Score: ${memory.lastScan.score || ""}
+- Verdict: ${memory.lastScan.verdict || ""}
+- Recommendation: ${memory.lastScan.recommendation || ""}
+`;
+  }
+
+  const userContent = imageUrl
+    ? [
+        { type: "text", text: context + "\nUser: " + (text || "Analyze this image.") },
+        { type: "image_url", image_url: { url: imageUrl } }
+      ]
+    : context + "\nUser: " + (text || "");
+
   try {
     const res = await openai.chat.completions.create({
       model: "gpt-5.1",
@@ -131,14 +178,14 @@ async function askAI(text) {
 You are Gorktimus Prime — an elite AI crypto defense system.
 
 Your personality:
-- Speak sharp, confident, slightly aggressive
-- No fluff, no corporate tone
-- Think like a sniper, not a chatbot
+- Speak sharp, confident, slightly aggressive, in a teaching manner
+- Keep it real, urban down to earth professional tone
+- Think like a sniper, Like a overall genuis and a elite analyst
 
 Your mission:
-- Protect users from scams, rugs, traps
+- Protect users from scams, rugs, traps, and dont sugarcoat shit
 - Break things down SIMPLE but powerful
-- Think like a high-level trader
+- Think like a elite master high-level supreme trader
 
 Your outputs MUST include:
 - Clear verdict: SAFE / RISKY / DANGER
@@ -146,25 +193,24 @@ Your outputs MUST include:
 - If needed: a warning or next move
 
 Rules:
-- If user sends a token → analyze it like a risk scanner
-- If user asks anything → respond like a trading assistant
+- If user sends a token → deep analyze it like a risk scanner
+- If user asks anything → respond like a trading assistant and guide
 - If unclear → ask a sharp follow-up
 
-Never speak like generic AI.
+Never speak like generic AI. And adapt to individual user mannaerism
           `
         },
         {
           role: "user",
-          content: text
+          content: userContent
         }
       ]
-    }); 
+    });
 
-    return `⚡ GORKTIMUS VERDICT\n\n${res.choices[0].message.content}`;
-
+    return `⚡ GORKTIMUS VERDICT\n\n${res.choices[0]?.message?.content || "No AI response returned."}`;
   } catch (err) {
     console.log("AI ERROR:", err?.message);
-    return "⚠️ AI temporarily unavailable.";
+    return "⚠️ Gorktimus temporarily unavailable.";
   }
 }
 // ================= CALLBACK HELPERS =================
@@ -2243,8 +2289,19 @@ if (inputInfo.type === "ticker") {
   snapshotPromise.catch(() => {});
 
   await sendCard(chatId, card, buildScanActionButtons(pair, query), "");
+updateSessionMemory(chatId, {
+  lastScan: {
+    query,
+    symbol: pair?.baseSymbol || "",
+    name: pair?.baseName || "",
+    tokenAddress: pair?.baseAddress || "",
+    chainId: pair?.chainId || "",
+    priceUsd: pair?.priceUsd || "",
+    liquidityUsd: pair?.liquidityUsd || "",
+    marketCap: pair?.marketCap || ""
+     }
+});
 }
-
 async function showTrending(chatId, userId = null) {
   const boosts = await fetchLatestBoosts();
   const top = boosts
@@ -2551,7 +2608,15 @@ async function showAIAssistant(chatId) {
     buildAIAssistantMenu()
   );
 }
+async function getTelegramPhotoUrl(photo) {
+  const best = photo[photo.length - 1];
+  if (!best?.file_id) return null;
 
+  const file = await bot.getFile(best.file_id);
+  if (!file?.file_path) return null;
+
+  return `https://api.telegram.org/file/bot${BOT_TOKEN}/${file.file_path}`;
+}
 bot.on("message", async (msg) => {
   try {
     if (!isPrivateChat(msg)) return;
@@ -2565,8 +2630,16 @@ bot.on("message", async (msg) => {
     if (!ok) return;
 
     const chatId = msg.chat.id;
-    const cleaned = String(msg.text || "").trim();
-    if (!cleaned) return;
+  const cleaned = String(msg.text || msg.caption || "").trim();
+const hasPhoto = Array.isArray(msg.photo) && msg.photo.length > 0;
+let imageUrl = null;
+
+if (hasPhoto) {
+  imageUrl = await getTelegramPhotoUrl(msg.photo);
+}
+if (!cleaned && !hasPhoto) return;
+let imageUrl = null;
+
 
     const pending = pendingAction.get(chatId);
 
@@ -2612,9 +2685,18 @@ bot.on("message", async (msg) => {
       return;
     }
 
-   if (pending?.type === "AI") {
-  const reply = await askAI(cleaned);
-  await sendText(chatId, `🤖 <b>Gorktimus AI Assistant</b>\n\n${escapeHtml(reply)}`, buildAIAssistantMenu());
+if (pending?.type === "AI") {
+  const reply = await askAI({
+    text: cleaned || "Analyze this image.",
+    chatId,
+    imageUrl
+  });
+
+  await sendText(
+    chatId,
+    `🤖 <b>Gorktimus AI Assistant</b>\n\n${escapeHtml(reply)}`,
+    buildAIAssistantMenu()
+  );
   return;
 }
 
