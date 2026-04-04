@@ -822,8 +822,7 @@ async function ensureSubscribedOrBlock(msgOrQuery) {
 
 // ================= MENUS =================
 function getDevModeStatus() {
-  const isDev = process.env.NODE_ENV === 'development';
-  return isDev ? `🔴 DEV: ON` : `🟢 PROD: ON`;
+  return DEV_MODE ? "🔴 DEV: ON" : "🟢 PROD: ON";
 }
 
 function buildMainMenu() {
