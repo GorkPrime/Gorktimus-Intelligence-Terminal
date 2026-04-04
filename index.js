@@ -2749,9 +2749,7 @@ bot.on("callback_query", async (query) => {
   if (!chainId || !tokenAddress) {
     await answerCallbackSafe(query.id);
     return sendText(chatId, `Invalid rescan data.`, buildMainMenuOnlyButton("refresh:watchlist"));
-  }
-  
-  await answerCallbackSafe(query.id);
+ 
   return await runTokenScan(chatId, tokenAddress, userId);
 }
 
