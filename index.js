@@ -87,7 +87,7 @@ const BOOSTS_CACHE_TTL_MS = 45000;
 // ================= DEV MODE =================
 const DEV_MODE = process.env.DEV_MODE === "true" && !!process.env.OWNER_USER_ID;
 const OWNER_USER_ID = process.env.OWNER_USER_ID || "";
-const OWNER_USER_ID = process.env.OWNER_USER_ID || "";
+
 // ================= DB HELPERS =================
 function getSessionMemory(chatId) {
   if (!sessionMemory.has(chatId)) {
