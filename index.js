@@ -2656,11 +2656,11 @@ async function getTelegramPhotoUrl(photo) {
 
   return `https://api.telegram.org/file/bot${BOT_TOKEN}/${file.file_path}`;
 }
-bot.on("message", async (msg) => {
+bot.onText(/\/start/, async (msg) => {
   try {
     if (!isPrivateChat(msg)) return;
     if (!msg?.from?.id || !msg?.chat?.id) return;
-    if (msg.text && msg.text.startsWith("/start")) return;
+    if (msg.text && msg.text.startsWith("/start")) return; // handled by bot.onText(/\/start/)
 
     const ok = await ensureSubscribedOrBlock(msg);
     await upsertUserFromMessage(msg, ok ? 1 : 0);
