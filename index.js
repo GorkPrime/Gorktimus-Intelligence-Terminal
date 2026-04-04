@@ -2754,7 +2754,6 @@ bot.on("callback_query", async (query) => {
   await answerCallbackSafe(query.id);
   return await runTokenScan(chatId, tokenAddress, userId);
 }
-    }
 
     await answerCallbackSafe(query.id);
 
