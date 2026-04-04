@@ -85,7 +85,12 @@ const PROFILES_CACHE_TTL_MS = 120000;
 const BOOSTS_CACHE_TTL_MS = 45000;
 
 // ================= DEV MODE =================
-const DEV_MODE = process.env.DEV_MODE === "true" && !!process.env.OWNER_USER_ID;
+
+function isDevMode() {
+  return process.env.DEV_MODE === "true" && !!process.env.OWNER_USER_ID;
+}
+
+const DEV_MODE = isDevMode();
 const OWNER_USER_ID = process.env.OWNER_USER_ID || "";
 
 // ================= DB HELPERS =================
