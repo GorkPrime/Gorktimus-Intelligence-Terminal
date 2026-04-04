@@ -2873,10 +2873,16 @@ So if a token is high on Dex but lower here, that usually means the terminal thi
     }
 
     if (data.startsWith("wallet_toggle:")) {
-      const id = data.split(":")[1];
-      await run(`UPDATE wallet_tracks SET alerts_enabled = CASE WHEN alerts_enabled = 1 THEN 0 ELSE 1 END, updated_at = ? WHERE id = ?`, [nowTs(), String(id)]);
-      return showWhaleMenu(chatId);
-    }
+  const id = data.split(":")[1];
+  await run(
+    `UPDATE wallet_tracks
+     SET alerts_enabled = CASE WHEN alerts_enabled = 1 THEN 0 ELSE 1 END,
+         updated_at = ?
+     WHERE id = ?`,
+    [nowTs(), String(id)]
+  );
+  return showWhaleMenu(chatId);
+}
 
     if (data.startsWith("wallet_remove:")) {
       const id = data.split(":")[1];
