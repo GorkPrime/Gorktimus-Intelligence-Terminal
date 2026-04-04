@@ -2742,10 +2742,18 @@ bot.on("callback_query", async (query) => {
     }
 
     if (data.startsWith("watch_rescan:")) {
-      const parts = data.split(":");
-      const tokenAddress = parts[2];
-      await answerCallbackSafe(query.id);
-      return await runTokenScan(chatId, tokenAddress, userId);
+  const parts = data.split(":");
+  const chainId = parts[1];
+  const tokenAddress = parts[2];
+  
+  if (!chainId || !tokenAddress) {
+    await answerCallbackSafe(query.id);
+    return sendText(chatId, `Invalid rescan data.`, buildMainMenuOnlyButton("refresh:watchlist"));
+  }
+  
+  await answerCallbackSafe(query.id);
+  return await runTokenScan(chatId, tokenAddress, userId);
+}
     }
 
     await answerCallbackSafe(query.id);
