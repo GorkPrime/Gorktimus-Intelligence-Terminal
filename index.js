@@ -2623,31 +2623,6 @@ async function handleRefresh(chatId, userId, key) {
 }
 
 
-// ================= COMMANDS =================
-async function ensureSubscribedOrBlock(msgOrQuery) {
-  const from = msgOrQuery.from;
-  const chatId = msgOrQuery.message?.chat?.id || msgOrQuery.chat?.id;
-  if (!from?.id || !chatId) return false;
-  
-  // ✅ DEV MODE: Owner bypasses all checks
-  if (DEV_MODE && String(from.id) === OWNER_USER_ID) {
-    return true;
-  }
-  
-  // ✅ DEV MODE: Non-owners blocked
-  if (DEV_MODE && String(from.id) !== OWNER_USER_ID) {
-    return false;
-  }
-  
-  // Normal mode: Check subscription
-  const ok = await isUserSubscribed(from.id);
-  if (!ok) {
-    await showSubscriptionRequired(chatId);
-    return false;
-  }
-  return true;
-}
-
 // ================= MESSAGE HANDLER =================
 async function showAIAssistant(chatId) {
   pendingAction.set(chatId, { type: "AI" });
@@ -2666,15 +2641,24 @@ async function getTelegramPhotoUrl(photo) {
 
   return `https://api.telegram.org/file/bot${BOT_TOKEN}/${file.file_path}`;
 }
+bot.onText(/\/start/, async (msg) => {
+  try {
+    const ok = await ensureSubscribedOrBlock(msg);
+    await upsertUserFromMessage(msg, ok ? 1 : 0);
+    await ensureUserSettings(msg.from.id);
+    await trackUserActivity(msg.from.id);
+    if (!ok) return;
+    await showMainMenu(msg.chat.id);
+  } catch (err) {
+    console.log("/start error:", err.message);
+  }
+});
+
 bot.on("message", async (msg) => {
   try {
-    if (DEV_MODE && String(msg.from?.id) !== OWNER_USER_ID) {
-      return;
-    }
-
     if (!isPrivateChat(msg)) return;
     if (!msg?.from?.id || !msg?.chat?.id) return;
-    if (msg.text && msg.text.startsWith("/start")) return;
+    if (msg.text && msg.text.startsWith("/start")) return; // handled by bot.onText(/\/start/)
 
     const ok = await ensureSubscribedOrBlock(msg);
     await upsertUserFromMessage(msg, ok ? 1 : 0);
