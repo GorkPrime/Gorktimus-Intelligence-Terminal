@@ -3020,7 +3020,7 @@ if (data.startsWith("feedbackbad:")) {
     console.log("callback error:", err.message);
     await sendText(chatId, `🧠 <b>Gorktimus</b>\n\nSomething broke in the callback flow.\n\nError: <code>${escapeHtml(err.message)}</code>`, buildMainMenuOnlyButton());
   }
-});
+}
 
 // ================= BOOT =================
 (async () => {
