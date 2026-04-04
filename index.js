@@ -812,6 +812,12 @@ async function ensureSubscribedOrBlock(msgOrQuery) {
   const from = msgOrQuery.from;
   const chatId = msgOrQuery.message?.chat?.id || msgOrQuery.chat?.id;
   if (!from?.id || !chatId) return false;
+  
+  // ✅ ADD: Enforce DEV_MODE early
+  if (DEV_MODE && String(from.id) !== OWNER_USER_ID) {
+    return false;
+  }
+  
   const ok = await isUserSubscribed(from.id);
   if (!ok) {
     await showSubscriptionRequired(chatId);
