@@ -3036,6 +3036,8 @@ if (data.startsWith("watch_remove:")) {
   }
 
 
+});
+
 // ================= BOOT =================
 (async () => {
   try {
@@ -3061,4 +3063,4 @@ process.on("SIGTERM", () => {
     db.close();
   } catch (_) {}
   process.exit(0);
-}); 15
+});
