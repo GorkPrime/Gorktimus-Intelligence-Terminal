@@ -180,7 +180,7 @@ Most recent scan context:
 
   try {
     const res = await openai.chat.completions.create({
-      model: "gpt-5.1",
+      model: "gpt-4-turbo",
       messages: [
         {
           role: "system",
@@ -384,7 +384,7 @@ async function initDb() {
     }
   }
 
- return []; 
+  return [];
 }
 function nowTs() {
   return Math.floor(Date.now() / 1000);
@@ -1273,20 +1273,20 @@ async function resolveBestPair(query, forceFresh = false) {
   while (tries < 3) {
     try {
       if (isAddressLike(q)) {
-     const chainCandidates = q.startsWith("0x")
-  ? ["base", "ethereum"]
-  : ["solana", "base", "ethereum"];  // Try all chains for Solana-like addresses
-const tokenResults = await Promise.all(
-  chainCandidates.map(async (chainId) => {
-    try {
-      return await fetchPairsByToken(chainId, q);
-    } catch (_) {
-      return [];
-    }
-  })
-);
+        const chainCandidates = q.startsWith("0x")
+          ? ["base", "ethereum"]
+          : ["solana", "base", "ethereum"];  // Try all chains for Solana-like addresses
+        const tokenResults = await Promise.all(
+          chainCandidates.map(async (chainId) => {
+            try {
+              return await fetchPairsByToken(chainId, q);
+            } catch (_) {
+              return [];
+            }
+          })
+        );
 
-const byTokenResults = tokenResults.flat();
+        const byTokenResults = tokenResults.flat();
 
         if (byTokenResults.length) {
           result = byTokenResults.sort((a, b) => rankPairQuality(b) - rankPairQuality(a))[0];
@@ -1302,8 +1302,8 @@ const byTokenResults = tokenResults.flat();
 
       const lowered = q.toLowerCase();
       result = pairs.sort((a, b) => {
-       const exactA = String(a.baseSymbol || "").toLowerCase() === lowered;
-const exactB = String(b.baseSymbol || "").toLowerCase() === lowered;
+        const exactA = String(a.baseSymbol || "").toLowerCase() === lowered;
+        const exactB = String(b.baseSymbol || "").toLowerCase() === lowered;
         if (exactA !== exactB) return exactB - exactA;
         return rankPairQuality(b) - rankPairQuality(a);
       })[0];
