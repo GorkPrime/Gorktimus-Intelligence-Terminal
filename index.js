@@ -7,6 +7,8 @@ const openai = new OpenAI({
 });
 
 const pairCache = new Map();
+const PAIR_CACHE_HIT_TTL_MS = 10000;
+const PAIR_CACHE_MISS_TTL_MS = 2000;
 
 function sleep(ms) {
   return new Promise(resolve => setTimeout(resolve, ms));
@@ -150,11 +152,29 @@ function all(sql, params = []) {
     });
   });
 }
+// Returns true when the user's message clearly refers to the previously scanned token
+function shouldUseLastScanContext(text) {
+  const lower = String(text || "").toLowerCase();
+  const referencePatterns = [
+    "this token", "that token", "this coin", "that coin", "the coin",
+    "last scan", "previous scan", "the token", "the project",
+    "is it safe", "should i buy", "should i buy it", "is it legit",
+    "what about liquidity", "what about the liquidity", "what about volume",
+    "rug or not", "is it a rug", "is it a scam", "worth it",
+    "should i ape", "should i invest", "that one", "this one",
+    "what do you think about it", "what do you think of it",
+    "give me your thoughts", "analyze it", "break it down",
+    "what's the verdict", "whats the verdict", "verdict on it",
+    "run it", "check it", "scan it"
+  ];
+  return referencePatterns.some(p => lower.includes(p));
+}
+
 async function askAI({ text, chatId, imageUrl = null }) {
   const memory = getSessionMemory(chatId);
 
   let context = "";
-  if (memory?.lastScan) {
+  if (memory?.lastScan && shouldUseLastScanContext(text)) {
     context = `
 Most recent scan context:
 - Query: ${memory.lastScan.query || ""}
@@ -185,29 +205,36 @@ Most recent scan context:
         {
           role: "system",
           content: `
-You are Gorktimus Prime — an elite AI crypto defense system.
+You are Gorktimus Prime — an elite AI crypto defense system and advisor.
 
 Your personality:
-- Speak sharp, confident, slightly aggressive, in a teaching manner
-- Keep it real, urban down to earth professional tone
-- Think like a sniper, Like a overall genuis and a elite analyst
+- Sharp, confident, slightly aggressive, teaching tone
+- Real, urban, down-to-earth professional
+- Think like a sniper — precise and deliberate
 
-Your mission:
-- Protect users from scams, rugs, traps, and dont sugarcoat shit
-- Break things down SIMPLE but powerful
-- Think like a elite master high-level supreme trader
+Your modes (pick the right one based on what the user is asking):
 
-Your outputs MUST include:
-- Clear verdict: SAFE / RISKY / DANGER
-- Short reasoning (2–5 lines max)
-- If needed: a warning or next move
+1. TOKEN ANALYSIS MODE — When user explicitly asks to scan, analyze, or check a token or contract:
+   - Give a clear verdict: SAFE / RISKY / DANGER
+   - Short reasoning (2–5 lines max)
+   - Include warning or recommended next move
+
+2. EXPLANATION MODE — When user asks general crypto questions (what is liquidity, how do rugs work, etc.):
+   - Answer naturally and clearly
+   - No forced verdict format
+   - Be educational but keep the sharp personality
+
+3. HELP MODE — When user asks about bot features, how things work, settings:
+   - Guide them simply and directly
+   - No verdict format needed
 
 Rules:
-- If user sends a token → deep analyze it like a risk scanner
-- If user asks anything → respond like a trading assistant and guide
-- If unclear → ask a sharp follow-up
-
-Never speak like generic AI. And adapt to individual user mannaerism
+- Do NOT force SAFE/RISKY/DANGER on every single response
+- Only use verdict format when user is clearly asking for a risk assessment or token scan
+- If scan context is provided above, use it when the user refers to that token
+- If no scan context is present or user asks a general question, respond conversationally
+- Never speak like generic AI — stay in character as Gorktimus Prime
+- Adapt to the user's tone and level of knowledge
           `
         },
         {
@@ -217,7 +244,7 @@ Never speak like generic AI. And adapt to individual user mannaerism
       ]
     });
 
-    return `⚡ GORKTIMUS VERDICT\n\n${res.choices[0]?.message?.content || "No AI response returned."}`;
+    return `⚡ GORKTIMUS\n\n${res.choices[0]?.message?.content || "No AI response returned."}`;
   } catch (err) {
     console.log("AI ERROR:", err?.message);
     return "⚠️ Gorktimus temporarily unavailable.";
@@ -1263,8 +1290,10 @@ async function resolveBestPair(query, forceFresh = false) {
   const now = Date.now();
   const cached = pairCache.get(cacheKey);
 
-  if (!forceFresh && cached && now - cached.ts < 10000 ) {
-    return cached.data;
+  // Separate TTL for null (miss) vs successful results to avoid suppressing fresh tokens
+  if (!forceFresh && cached) {
+    const ttl = cached.data === null ? PAIR_CACHE_MISS_TTL_MS : PAIR_CACHE_HIT_TTL_MS;
+    if (now - cached.ts < ttl) return cached.data;
   }
 
   let result = null;
@@ -1272,10 +1301,11 @@ async function resolveBestPair(query, forceFresh = false) {
 
   while (tries < 3) {
     try {
+      // Stage 1: Address input — search token-pairs endpoint across likely chains
       if (isAddressLike(q)) {
         const chainCandidates = q.startsWith("0x")
           ? ["base", "ethereum"]
-          : ["solana", "base", "ethereum"];  // Try all chains for Solana-like addresses
+          : ["solana", "base", "ethereum"];
         const tokenResults = await Promise.all(
           chainCandidates.map(async (chainId) => {
             try {
@@ -1289,25 +1319,75 @@ async function resolveBestPair(query, forceFresh = false) {
         const byTokenResults = tokenResults.flat();
 
         if (byTokenResults.length) {
+          console.log(`resolveBestPair stage1 hit for ${q}`);
           result = byTokenResults.sort((a, b) => rankPairQuality(b) - rankPairQuality(a))[0];
+          break;
+        }
+        console.log(`resolveBestPair stage1 miss for ${q} — falling through to search`);
+      }
+
+      // Stage 2: DexScreener search endpoint
+      const pairs = await searchDexPairs(q);
+      if (pairs.length) {
+        console.log(`resolveBestPair stage2 hit for ${q} (${pairs.length} candidates)`);
+        const lowered = q.toLowerCase();
+        result = pairs.sort((a, b) => {
+          const exactA = String(a.baseSymbol || "").toLowerCase() === lowered;
+          const exactB = String(b.baseSymbol || "").toLowerCase() === lowered;
+          if (exactA !== exactB) return exactB - exactA;
+          return rankPairQuality(b) - rankPairQuality(a);
+        })[0];
+        break;
+      }
+
+      console.log(`resolveBestPair stage2 miss for ${q} — trying normalized variations`);
+
+      // Stage 3: Normalized query variations (strip symbols, try uppercase/lowercase)
+      const rawVariations = [
+        q.replace(/[$]/g, ""),
+        q.replace(/[^a-zA-Z0-9]/g, ""),
+        q !== q.toUpperCase() ? q.toUpperCase() : null,
+        q !== q.toLowerCase() ? q.toLowerCase() : null
+      ];
+      const variations = [...new Set(rawVariations.filter(v => v && v !== q))];
+
+      for (const variant of variations) {
+        const varPairs = await searchDexPairs(variant).catch(() => []);
+        if (varPairs.length) {
+          console.log(`resolveBestPair stage3 hit for variant "${variant}" of "${q}"`);
+          const lowered = variant.toLowerCase();
+          result = varPairs.sort((a, b) => {
+            const exactA = String(a.baseSymbol || "").toLowerCase() === lowered;
+            const exactB = String(b.baseSymbol || "").toLowerCase() === lowered;
+            if (exactA !== exactB) return exactB - exactA;
+            return rankPairQuality(b) - rankPairQuality(a);
+          })[0];
           break;
         }
       }
 
-      const pairs = await searchDexPairs(q);
-      if (!pairs.length) {
-        result = null;
-        break;
+      if (result) break;
+
+      // Stage 4: Inspect latest profiles for very new tokens
+      console.log(`resolveBestPair stage3 miss for ${q} — checking latest profiles`);
+      const profiles = await fetchLatestProfiles().catch(() => []);
+      const profileHit = profiles.find(p =>
+        String(p?.tokenAddress || "") === q ||
+        String(p?.symbol || "").toLowerCase() === q.toLowerCase()
+      );
+      if (profileHit) {
+        const chainId = String(profileHit.chainId || "solana").toLowerCase();
+        const tokenAddress = String(profileHit.tokenAddress || "");
+        if (tokenAddress) {
+          const profilePairs = await fetchPairsByToken(chainId, tokenAddress).catch(() => []);
+          if (profilePairs.length) {
+            console.log(`resolveBestPair stage4 hit via profiles for ${q}`);
+            result = profilePairs.sort((a, b) => rankPairQuality(b) - rankPairQuality(a))[0];
+          }
+        }
       }
 
-      const lowered = q.toLowerCase();
-      result = pairs.sort((a, b) => {
-        const exactA = String(a.baseSymbol || "").toLowerCase() === lowered;
-        const exactB = String(b.baseSymbol || "").toLowerCase() === lowered;
-        if (exactA !== exactB) return exactB - exactA;
-        return rankPairQuality(b) - rankPairQuality(a);
-      })[0];
-
+      if (!result) console.log(`resolveBestPair all stages exhausted for ${q}`);
       break;
     } catch (err) {
       const status = err?.response?.status;
@@ -1878,6 +1958,7 @@ async function buildScanCard(pair, heading, userId = null) {
     `🛡 <b>Safety Score:</b> ${verdict.score}/99`,
     `📌 <b>Grade:</b> ${escapeHtml(verdict.grade)}`,
     `🎯 <b>Confidence:</b> ${escapeHtml(verdict.confidenceMeta.confidence)} (${escapeHtml(verdict.confidenceMeta.checksText)})`,
+    verdict.confidenceMeta.confidence === "Low" ? `⚠️ <i>Limited data available — token may be too new or partially indexed.</i>` : ``,
     ``,
     `💧 <b>Liquidity:</b> ${shortUsd(pair.liquidityUsd)} • ${escapeHtml(verdict.liquidity.label)}`,
     `📊 <b>24H Volume:</b> ${shortUsd(pair.volumeH24)} • ${escapeHtml(verdict.volume.label)}`,
@@ -2302,12 +2383,12 @@ async function runTokenScan(chatId, query, userId = null) {
 const inputInfo = detectInputType(query);
 
 if (inputInfo.type === "ticker") {
+  // Warn about ambiguity but still attempt the lookup — don't hard-stop
   await sendText(
     chatId,
-    `🧠 <b>Gorktimus Intelligence Terminal</b>\n\n⚠️ <b>Ticker-only scan detected</b>\n\nMultiple coins can share the same ticker.\n\nFor an exact result, paste the <b>contract address</b> or DexScreener token link.`,
+    `🧠 <b>Gorktimus Intelligence Terminal</b>\n\n⚠️ <b>Ticker search — attempting match</b>\n\nMultiple coins can share the same ticker. Running best-match search now...`,
     buildMainMenuOnlyButton("scan_token")
   );
-  return;
 }
   const pair = await resolveBestPair(query, false);
 
@@ -2317,11 +2398,19 @@ if (inputInfo.type === "ticker") {
   }
 
   if (!pair) {
-    await sendText(
-      chatId,
-      `🧠 <b>Gorktimus Intelligence Terminal</b>\n\n🔎 <b>Token Scan</b>\n\nNo solid token match was found for <b>${escapeHtml(query)}</b>.`,
-      buildMainMenuOnlyButton("scan_token")
-    );
+    const isTickerInput = inputInfo.type === "ticker";
+    const isAddressInput = isAddressLike(query);
+    let noMatchMsg;
+
+    if (isTickerInput) {
+      noMatchMsg = `🧠 <b>Gorktimus Intelligence Terminal</b>\n\n🔎 <b>Token Scan</b>\n\n⚠️ No strong match found for ticker <b>${escapeHtml(query)}</b>.\n\nTicker searches can match multiple coins or return nothing if the token is very new.\n\n📋 For an exact result, send the <b>contract address</b> or a DexScreener link.`;
+    } else if (isAddressInput) {
+      noMatchMsg = `🧠 <b>Gorktimus Intelligence Terminal</b>\n\n🔎 <b>Token Scan</b>\n\n⚠️ No data found for that address.\n\nThis token may be <b>very new</b>, not yet indexed on DexScreener, or on an unsupported chain.\n\n📋 Try again in a few minutes, or send a DexScreener link if you have one.`;
+    } else {
+      noMatchMsg = `🧠 <b>Gorktimus Intelligence Terminal</b>\n\n🔎 <b>Token Scan</b>\n\n⚠️ Could not resolve <b>${escapeHtml(query)}</b> as a token.\n\nTry sending a <b>contract address</b>, ticker symbol, or DexScreener link for best results.`;
+    }
+
+    await sendText(chatId, noMatchMsg, buildMainMenuOnlyButton("scan_token"));
     return;
   }
 
