@@ -1,6 +1,7 @@
 const TelegramBot = require("node-telegram-bot-api");
 const axios = require("axios");
 const OpenAI = require("openai");
+const { initHealthMonitor } = require("./health-monitor");
 
 const openai = new OpenAI({
   apiKey: process.env.OPENAI_API_KEY
@@ -369,11 +370,41 @@ async function initDb() {
   try {
     await run(`ALTER TABLE user_settings ADD COLUMN last_scan_query TEXT DEFAULT ''`);
   } catch (_) {}
+
+  // ── Health monitoring tables ─────────────────────────────────────────────
+  await run(`
+    CREATE TABLE IF NOT EXISTS error_logs (
+      id        INTEGER PRIMARY KEY AUTOINCREMENT,
+      message   TEXT    NOT NULL,
+      stack     TEXT    DEFAULT '',
+      severity  TEXT    DEFAULT 'low',
+      ts        INTEGER NOT NULL
+    )
+  `);
+
+  await run(`
+    CREATE TABLE IF NOT EXISTS health_metrics (
+      id            INTEGER PRIMARY KEY AUTOINCREMENT,
+      uptime_sec    INTEGER DEFAULT 0,
+      restart_count INTEGER DEFAULT 0,
+      error_count   INTEGER DEFAULT 0,
+      ts            INTEGER NOT NULL
+    )
+  `);
+
+  await run(`
+    CREATE TABLE IF NOT EXISTS update_history (
+      id         INTEGER PRIMARY KEY AUTOINCREMENT,
+      event_type TEXT    NOT NULL,
+      notes      TEXT    DEFAULT '',
+      ts         INTEGER NOT NULL
+    )
+  `);
 }
 
 // ================= BASIC HELPERS =================
 
-  async function fetchHeliusTokenLargestAccounts(mint) {
+async function fetchHeliusTokenLargestAccounts(mint) {
   const now = Date.now();
   const cached = largestAccountsCache.get(mint);
 
@@ -871,7 +902,7 @@ async function ensureSubscribedOrBlock(msgOrQuery) {
 
 // ================= MENUS =================
 function getDevModeStatus() {
-  return isDevMode() ? "🔴 DEV: ON" : "🟢 PROD: ON";
+  return DEV_MODE ? "🔴 DEV: ON" : "🟢 PROD: ON";
 }
 function buildMainMenu() {
   const growthRow = BOT_USERNAME
@@ -3170,6 +3201,17 @@ if (data.startsWith("watch_remove:")) {
     const me = await bot.getMe();
     BOT_USERNAME = me?.username || "";
     console.log(`✅ Gorktimus online as @${BOT_USERNAME || "unknown_bot"}`);
+
+    // Start health monitoring after DB is ready
+    initHealthMonitor({
+      bot,
+      run,
+      get,
+      callbackStore,
+      sessionMemory,
+      ownerUserId: OWNER_USER_ID,
+      devMode: DEV_MODE
+    });
   } catch (err) {
     console.error("❌ Boot error:", err.message);
     process.exit(1);
