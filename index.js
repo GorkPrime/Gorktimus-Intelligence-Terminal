@@ -521,15 +521,23 @@ async function fetchLiquidityLockStatus(pair) {
       const locked = accounts.some((acc) =>
         SOLANA_LOCK_PROGRAMS.includes(acc.address)
       );
+      // Only conclude "locked" when a known program address is confirmed in
+      // the top accounts.  We cannot conclude "unlocked" from this check
+      // because getTokenLargestAccounts returns SPL token-account addresses,
+      // not their owning program IDs — the locker program address will never
+      // appear in acc.address.  Return "unknown" when no match is found so
+      // the score is not incorrectly penalised.
       result = locked
         ? { status: "locked", label: "🔐 ✅ Locked - Passed" }
-        : { status: "unlocked", label: "🔐 ❌ Unlocked - Failed" };
+        : { status: "unknown", label: "🔐 ❓ Unknown" };
     } else if (isEvmChain(chainId)) {
       // Known EVM LP locker contract addresses (Unicrypt, Team Finance, etc.)
+      // All addresses are stored in lowercase so the case-insensitive comparison
+      // below (which lowercases the holder address from the API) works correctly.
       const EVM_LOCK_CONTRACTS = [
         "0x663a5c229c09b049e36dcc11a9b0d4a8eb9db214", // Unicrypt v2
         "0xdba68f07d1b7ca219f78ae8582c213d975c25caf", // Team Finance
-        "0x71B5759d73262FBb223956913ecF4ecC51057641"  // PinkLock
+        "0x71b5759d73262fbb223956913ecf4ecc51057641"  // PinkLock
       ];
       const chainNum = EVM_CHAIN_IDS[chainId];
       if (chainNum && ETHERSCAN_API_KEY) {

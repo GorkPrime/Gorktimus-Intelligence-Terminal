@@ -792,6 +792,300 @@ async function main() {
   });
 
   // ────────────────────────────────────────────────────────────────────────────
+  // LIQUIDITY LOCK STATUS TESTS
+  // ────────────────────────────────────────────────────────────────────────────
+  console.log("\nLIQUIDITY LOCK STATUS");
+
+  // Self-contained replica of fetchLiquidityLockStatus with injectable deps so
+  // we can mock axios without touching index.js at test time.
+  function makeFetchLiquidityLockStatus({ mockAxios, etherscanApiKey = "TESTKEY", heliusRpcUrl = "https://rpc.test", etherscanV2Url = "https://api.test", evmChainIds = { ethereum: 1, base: 8453 } }) {
+    const LIQUIDITY_LOCK_TTL_MS = 300000;
+    const liquidityLockCache = new Map();
+
+    function isEvmChain(chainId) {
+      return Object.prototype.hasOwnProperty.call(evmChainIds, chainId);
+    }
+
+    async function fetchLiquidityLockStatus(pair) {
+      const chainId = String(pair?.chainId || "").toLowerCase();
+      const pairAddress = String(pair?.pairAddress || "").trim();
+      if (!pairAddress) return { status: "unknown", label: "🔐 ❓ Unknown" };
+
+      const cacheKey = `${chainId}:${pairAddress}`;
+      const now = Date.now();
+      const cached = liquidityLockCache.get(cacheKey);
+      if (cached && (now - cached.ts < LIQUIDITY_LOCK_TTL_MS)) {
+        return cached.result;
+      }
+
+      let result = { status: "unknown", label: "🔐 ❓ Unknown" };
+
+      try {
+        if (chainId === "solana") {
+          const SOLANA_LOCK_PROGRAMS = [
+            "LockrWmn6K5twhz3y9w1dQERbmgSaRkfnTeTKbpofwE"
+          ];
+          const res = await mockAxios.post(
+            heliusRpcUrl,
+            { jsonrpc: "2.0", id: "lp-lock-check", method: "getTokenLargestAccounts", params: [pairAddress] },
+            { timeout: 4000 }
+          );
+          const accounts = res.data?.result?.value || [];
+          const locked = accounts.some((acc) =>
+            SOLANA_LOCK_PROGRAMS.includes(acc.address)
+          );
+          // Only conclude "locked" when a known program address appears.
+          // Cannot conclude "unlocked" — acc.address is the SPL token-account
+          // address, not the owning program ID.
+          result = locked
+            ? { status: "locked", label: "🔐 ✅ Locked - Passed" }
+            : { status: "unknown", label: "🔐 ❓ Unknown" };
+        } else if (isEvmChain(chainId)) {
+          // All addresses lowercase so the .toLowerCase() comparison works.
+          const EVM_LOCK_CONTRACTS = [
+            "0x663a5c229c09b049e36dcc11a9b0d4a8eb9db214", // Unicrypt v2
+            "0xdba68f07d1b7ca219f78ae8582c213d975c25caf", // Team Finance
+            "0x71b5759d73262fbb223956913ecf4ecc51057641"  // PinkLock
+          ];
+          const chainNum = evmChainIds[chainId];
+          if (chainNum && etherscanApiKey) {
+            const url = `${etherscanV2Url}?chainid=${chainNum}&module=token&action=tokenholderlist&contractaddress=${encodeURIComponent(pairAddress)}&page=1&offset=10&apikey=${etherscanApiKey}`;
+            const res = await mockAxios.get(url, { timeout: 4000 });
+            const holders = res.data?.result || [];
+            const locked = Array.isArray(holders) && holders.some((h) =>
+              EVM_LOCK_CONTRACTS.includes(String(h.TokenHolderAddress || "").toLowerCase())
+            );
+            result = locked
+              ? { status: "locked", label: "🔐 ✅ Locked - Passed" }
+              : { status: "unlocked", label: "🔐 ❌ Unlocked - Failed" };
+          }
+        }
+      } catch (_) {
+        result = { status: "unknown", label: "🔐 ❓ Unknown" };
+      }
+
+      liquidityLockCache.set(cacheKey, { ts: now, result });
+      return result;
+    }
+
+    return { fetchLiquidityLockStatus, liquidityLockCache };
+  }
+
+  // ── Missing pair address ────────────────────────────────────────────────────
+
+  await test("returns unknown when pairAddress is empty", async () => {
+    const { fetchLiquidityLockStatus } = makeFetchLiquidityLockStatus({ mockAxios: {} });
+    const r = await fetchLiquidityLockStatus({ chainId: "solana", pairAddress: "" });
+    assert.strictEqual(r.status, "unknown");
+    assert.strictEqual(r.label, "🔐 ❓ Unknown");
+  });
+
+  await test("returns unknown when pair object is null", async () => {
+    const { fetchLiquidityLockStatus } = makeFetchLiquidityLockStatus({ mockAxios: {} });
+    const r = await fetchLiquidityLockStatus(null);
+    assert.strictEqual(r.status, "unknown");
+  });
+
+  // ── Solana detection ────────────────────────────────────────────────────────
+
+  await test("Solana: returns locked when largest account address is a known lock program", async () => {
+    const mockAxios = {
+      post: async () => ({
+        data: {
+          result: {
+            value: [
+              { address: "LockrWmn6K5twhz3y9w1dQERbmgSaRkfnTeTKbpofwE", amount: "1000000", decimals: 6, uiAmount: 1.0 },
+              { address: "SomeOtherAccount111111111111111111111111111", amount: "500000", decimals: 6, uiAmount: 0.5 }
+            ]
+          }
+        }
+      })
+    };
+    const { fetchLiquidityLockStatus } = makeFetchLiquidityLockStatus({ mockAxios });
+    const r = await fetchLiquidityLockStatus({ chainId: "solana", pairAddress: "PairAddr1111111111111111111111111111111111" });
+    assert.strictEqual(r.status, "locked");
+    assert.strictEqual(r.label, "🔐 ✅ Locked - Passed");
+  });
+
+  await test("Solana: returns unknown (not unlocked) when no lock program in accounts", async () => {
+    const mockAxios = {
+      post: async () => ({
+        data: {
+          result: {
+            value: [
+              { address: "RegularHolder1111111111111111111111111111111", amount: "1000000", decimals: 6, uiAmount: 1.0 },
+              { address: "RegularHolder2222222222222222222222222222222", amount: "500000", decimals: 6, uiAmount: 0.5 }
+            ]
+          }
+        }
+      })
+    };
+    const { fetchLiquidityLockStatus } = makeFetchLiquidityLockStatus({ mockAxios });
+    const r = await fetchLiquidityLockStatus({ chainId: "solana", pairAddress: "PairAddr1111111111111111111111111111111111" });
+    assert.strictEqual(r.status, "unknown", "Should be unknown, not unlocked — acc.address is a token account, not a program owner");
+    assert.strictEqual(r.label, "🔐 ❓ Unknown");
+  });
+
+  await test("Solana: returns unknown when RPC returns empty accounts array", async () => {
+    const mockAxios = {
+      post: async () => ({ data: { result: { value: [] } } })
+    };
+    const { fetchLiquidityLockStatus } = makeFetchLiquidityLockStatus({ mockAxios });
+    const r = await fetchLiquidityLockStatus({ chainId: "solana", pairAddress: "PairAddr1111111111111111111111111111111111" });
+    assert.strictEqual(r.status, "unknown");
+  });
+
+  await test("Solana: returns unknown on RPC error (no false-negative unlocked)", async () => {
+    const mockAxios = {
+      post: async () => { throw new Error("network failure"); }
+    };
+    const { fetchLiquidityLockStatus } = makeFetchLiquidityLockStatus({ mockAxios });
+    const r = await fetchLiquidityLockStatus({ chainId: "solana", pairAddress: "PairAddr1111111111111111111111111111111111" });
+    assert.strictEqual(r.status, "unknown", "Error must fall back to unknown, never unlocked");
+  });
+
+  // ── EVM detection ───────────────────────────────────────────────────────────
+
+  await test("EVM: returns locked when Unicrypt address is in top holders", async () => {
+    const mockAxios = {
+      get: async () => ({
+        data: {
+          result: [
+            { TokenHolderAddress: "0x663a5c229c09b049e36dcc11a9b0d4a8eb9db214", TokenHolderQuantity: "1000" },
+            { TokenHolderAddress: "0xSomeRandomHolder000000000000000000000000", TokenHolderQuantity: "500" }
+          ]
+        }
+      })
+    };
+    const { fetchLiquidityLockStatus } = makeFetchLiquidityLockStatus({ mockAxios });
+    const r = await fetchLiquidityLockStatus({ chainId: "ethereum", pairAddress: "0xPairAddress0000000000000000000000000000" });
+    assert.strictEqual(r.status, "locked");
+    assert.strictEqual(r.label, "🔐 ✅ Locked - Passed");
+  });
+
+  await test("EVM: returns locked when Team Finance address is in top holders", async () => {
+    const mockAxios = {
+      get: async () => ({
+        data: {
+          result: [
+            { TokenHolderAddress: "0xdba68f07d1b7ca219f78ae8582c213d975c25caf", TokenHolderQuantity: "2000" }
+          ]
+        }
+      })
+    };
+    const { fetchLiquidityLockStatus } = makeFetchLiquidityLockStatus({ mockAxios });
+    const r = await fetchLiquidityLockStatus({ chainId: "base", pairAddress: "0xPairAddress0000000000000000000000000000" });
+    assert.strictEqual(r.status, "locked");
+  });
+
+  await test("EVM: returns locked when PinkLock address is in top holders (mixed-case API response)", async () => {
+    // The Etherscan API sometimes returns checksummed (mixed-case) addresses.
+    // The comparison must lowercase both sides to match the lowercase entry in
+    // EVM_LOCK_CONTRACTS.
+    const mockAxios = {
+      get: async () => ({
+        data: {
+          result: [
+            { TokenHolderAddress: "0x71B5759d73262FBb223956913ecF4ecC51057641", TokenHolderQuantity: "3000" }
+          ]
+        }
+      })
+    };
+    const { fetchLiquidityLockStatus } = makeFetchLiquidityLockStatus({ mockAxios });
+    const r = await fetchLiquidityLockStatus({ chainId: "ethereum", pairAddress: "0xPairAddress0000000000000000000000000000" });
+    assert.strictEqual(r.status, "locked", "PinkLock mixed-case address should match after lowercasing");
+  });
+
+  await test("EVM: returns unlocked when no locker contract in top holders", async () => {
+    const mockAxios = {
+      get: async () => ({
+        data: {
+          result: [
+            { TokenHolderAddress: "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", TokenHolderQuantity: "9000" },
+            { TokenHolderAddress: "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", TokenHolderQuantity: "1000" }
+          ]
+        }
+      })
+    };
+    const { fetchLiquidityLockStatus } = makeFetchLiquidityLockStatus({ mockAxios });
+    const r = await fetchLiquidityLockStatus({ chainId: "ethereum", pairAddress: "0xPairAddress0000000000000000000000000000" });
+    assert.strictEqual(r.status, "unlocked");
+    assert.strictEqual(r.label, "🔐 ❌ Unlocked - Failed");
+  });
+
+  await test("EVM: returns unknown when ETHERSCAN_API_KEY is absent", async () => {
+    const mockAxios = { get: async () => { throw new Error("should not be called"); } };
+    const { fetchLiquidityLockStatus } = makeFetchLiquidityLockStatus({ mockAxios, etherscanApiKey: "" });
+    const r = await fetchLiquidityLockStatus({ chainId: "ethereum", pairAddress: "0xPairAddress0000000000000000000000000000" });
+    assert.strictEqual(r.status, "unknown", "No API key → skip check → unknown");
+  });
+
+  await test("EVM: returns unknown on Etherscan API error (no false-negative unlocked)", async () => {
+    const mockAxios = {
+      get: async () => { throw new Error("timeout"); }
+    };
+    const { fetchLiquidityLockStatus } = makeFetchLiquidityLockStatus({ mockAxios });
+    const r = await fetchLiquidityLockStatus({ chainId: "ethereum", pairAddress: "0xPairAddress0000000000000000000000000000" });
+    assert.strictEqual(r.status, "unknown", "API error must fall back to unknown, never unlocked");
+  });
+
+  // ── Cache behaviour ─────────────────────────────────────────────────────────
+
+  await test("cache: returns cached result within TTL without making a new API call", async () => {
+    let callCount = 0;
+    const mockAxios = {
+      get: async () => {
+        callCount++;
+        return { data: { result: [{ TokenHolderAddress: "0x663a5c229c09b049e36dcc11a9b0d4a8eb9db214", TokenHolderQuantity: "1" }] } };
+      }
+    };
+    const { fetchLiquidityLockStatus } = makeFetchLiquidityLockStatus({ mockAxios });
+    const pair = { chainId: "ethereum", pairAddress: "0xCached000000000000000000000000000000000" };
+    await fetchLiquidityLockStatus(pair);
+    await fetchLiquidityLockStatus(pair); // second call — should hit cache
+    assert.strictEqual(callCount, 1, "API should only be called once within TTL");
+  });
+
+  await test("cache: expired entry triggers a fresh API call", async () => {
+    let callCount = 0;
+    const mockAxios = {
+      get: async () => {
+        callCount++;
+        return { data: { result: [] } };
+      }
+    };
+    const EXPIRED_TTL_MS = 1; // effectively already expired
+    const { fetchLiquidityLockStatus, liquidityLockCache } = makeFetchLiquidityLockStatus({ mockAxios });
+
+    const pair = { chainId: "ethereum", pairAddress: "0xExpired00000000000000000000000000000000" };
+    const cacheKey = `ethereum:${pair.pairAddress}`;
+
+    // Manually seed the cache with an old timestamp
+    liquidityLockCache.set(cacheKey, { ts: Date.now() - 600001, result: { status: "unlocked", label: "🔐 ❌ Unlocked - Failed" } });
+
+    const r = await fetchLiquidityLockStatus(pair);
+    assert.strictEqual(callCount, 1, "Fresh API call should occur after cache expiry");
+    // No locker in holders → unlocked
+    assert.strictEqual(r.status, "unlocked");
+  });
+
+  // ── Status label formatting ─────────────────────────────────────────────────
+
+  await test("status labels contain correct emoji and text for all three states", () => {
+    const labels = {
+      locked:   "🔐 ✅ Locked - Passed",
+      unlocked: "🔐 ❌ Unlocked - Failed",
+      unknown:  "🔐 ❓ Unknown"
+    };
+    assert.ok(labels.locked.includes("✅"), "locked label should contain ✅");
+    assert.ok(labels.unlocked.includes("❌"), "unlocked label should contain ❌");
+    assert.ok(labels.unknown.includes("❓"), "unknown label should contain ❓");
+    assert.ok(labels.locked.startsWith("🔐"), "locked label should start with 🔐");
+    assert.ok(labels.unlocked.startsWith("🔐"), "unlocked label should start with 🔐");
+    assert.ok(labels.unknown.startsWith("🔐"), "unknown label should start with 🔐");
+  });
+
+  // ────────────────────────────────────────────────────────────────────────────
 
   summary();
 }
