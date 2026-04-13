@@ -482,6 +482,316 @@ async function main() {
   });
 
   // ────────────────────────────────────────────────────────────────────────────
+  // FLAGGED WALLETS / LIQUIDITY LOCK / RISK RANK TESTS
+  // ────────────────────────────────────────────────────────────────────────────
+  console.log("\nFLAGGED WALLETS & RISK FEATURES");
+
+  async function makeFeatureDb() {
+    const { run, get, all, close } = makeDb();
+    const nowTs = () => Math.floor(Date.now() / 1000);
+
+    await run(`
+      CREATE TABLE IF NOT EXISTS flagged_wallets (
+        wallet_address TEXT NOT NULL,
+        chain_id       TEXT NOT NULL DEFAULT 'solana',
+        risk_level     TEXT NOT NULL DEFAULT 'low',
+        reason         TEXT DEFAULT '',
+        reported_by    TEXT DEFAULT '',
+        reports_count  INTEGER DEFAULT 1,
+        last_updated   INTEGER NOT NULL,
+        created_at     INTEGER NOT NULL,
+        PRIMARY KEY (wallet_address, chain_id)
+      )
+    `);
+
+    await run(`
+      CREATE TABLE IF NOT EXISTS instance_lock (
+        id         INTEGER PRIMARY KEY CHECK (id = 1),
+        locked_at  INTEGER NOT NULL,
+        expires_at INTEGER NOT NULL
+      )
+    `);
+
+    async function flagWallet(walletAddress, chainId, riskLevel, reason) {
+      const ts = nowTs();
+      await run(
+        `INSERT INTO flagged_wallets (wallet_address, chain_id, risk_level, reason, reported_by, reports_count, last_updated, created_at)
+         VALUES (?, ?, ?, ?, '', 1, ?, ?)
+         ON CONFLICT(wallet_address, chain_id) DO UPDATE SET
+           risk_level = excluded.risk_level,
+           reason = excluded.reason,
+           reports_count = reports_count + 1,
+           last_updated = excluded.last_updated`,
+        [String(walletAddress).toLowerCase(), String(chainId).toLowerCase(), riskLevel, reason, ts, ts]
+      );
+    }
+
+    async function checkDevWalletReputation(walletAddress, chainId) {
+      if (!walletAddress) return null;
+      try {
+        const row = await get(
+          `SELECT * FROM flagged_wallets WHERE wallet_address = ? AND (chain_id = ? OR chain_id = 'all') LIMIT 1`,
+          [String(walletAddress).toLowerCase(), String(chainId || "").toLowerCase()]
+        );
+        return row || null;
+      } catch (_) {
+        return null;
+      }
+    }
+
+    return { run, get, all, close, flagWallet, checkDevWalletReputation };
+  }
+
+  await test("flagged_wallets table can be created and a wallet flagged", async () => {
+    const { get, close, flagWallet } = await makeFeatureDb();
+    await flagWallet("0xdeadbeef1234", "ethereum", "high", "Known rug puller");
+    const row = await get(`SELECT * FROM flagged_wallets WHERE wallet_address = ?`, ["0xdeadbeef1234"]);
+    assert.ok(row, "Flagged wallet should exist");
+    assert.strictEqual(row.risk_level, "high");
+    assert.strictEqual(row.reason, "Known rug puller");
+    assert.strictEqual(row.chain_id, "ethereum");
+    await close();
+  });
+
+  await test("checkDevWalletReputation returns null for unknown wallets", async () => {
+    const { close, checkDevWalletReputation } = await makeFeatureDb();
+    const result = await checkDevWalletReputation("0xunknown999", "ethereum");
+    assert.strictEqual(result, null);
+    await close();
+  });
+
+  await test("checkDevWalletReputation finds flagged wallet by address", async () => {
+    const { close, flagWallet, checkDevWalletReputation } = await makeFeatureDb();
+    await flagWallet("SCAMWALLET123", "solana", "critical", "Multiple rug pulls");
+    const result = await checkDevWalletReputation("SCAMWALLET123", "solana");
+    assert.ok(result, "Should find the flagged wallet");
+    assert.strictEqual(result.risk_level, "critical");
+    await close();
+  });
+
+  await test("checkDevWalletReputation is case-insensitive", async () => {
+    const { close, flagWallet, checkDevWalletReputation } = await makeFeatureDb();
+    await flagWallet("MixedCaseWallet", "solana", "medium", "Suspicious activity");
+    const result = await checkDevWalletReputation("MIXEDCASEWALLET", "solana");
+    assert.ok(result, "Should find the flagged wallet case-insensitively");
+    assert.strictEqual(result.risk_level, "medium");
+    await close();
+  });
+
+  await test("flagWallet upserts on duplicate and increments reports_count", async () => {
+    const { get, close, flagWallet } = await makeFeatureDb();
+    await flagWallet("dupeWallet", "ethereum", "low", "First report");
+    await flagWallet("dupewallet", "ethereum", "high", "Second report — escalated");
+    const row = await get(`SELECT * FROM flagged_wallets WHERE wallet_address = ?`, ["dupewallet"]);
+    assert.ok(row, "Row should exist");
+    assert.strictEqual(row.risk_level, "high", "risk_level should be updated");
+    assert.ok(row.reports_count >= 2, "reports_count should be incremented");
+    await close();
+  });
+
+  // ── Risk Rank Tests ──────────────────────────────────────────────────────────
+  await test("computeRiskRank returns None for high score with no dev flags", () => {
+    function computeRiskRank(score, devReputation) {
+      const devLevel = String(devReputation?.risk_level || "none").toLowerCase();
+      if (score < 25 || devLevel === "critical") return "Critical";
+      if (score < 40 || devLevel === "high") return "High";
+      if (score < 55 || devLevel === "medium") return "Medium";
+      if (score < 70 || devLevel === "low") return "Low";
+      return "None";
+    }
+    assert.strictEqual(computeRiskRank(80, null), "None");
+    assert.strictEqual(computeRiskRank(70, null), "None");
+  });
+
+  await test("computeRiskRank returns Critical for score < 25", () => {
+    function computeRiskRank(score, devReputation) {
+      const devLevel = String(devReputation?.risk_level || "none").toLowerCase();
+      if (score < 25 || devLevel === "critical") return "Critical";
+      if (score < 40 || devLevel === "high") return "High";
+      if (score < 55 || devLevel === "medium") return "Medium";
+      if (score < 70 || devLevel === "low") return "Low";
+      return "None";
+    }
+    assert.strictEqual(computeRiskRank(20, null), "Critical");
+    assert.strictEqual(computeRiskRank(1, null), "Critical");
+  });
+
+  await test("computeRiskRank escalates to Critical when dev is critical regardless of score", () => {
+    function computeRiskRank(score, devReputation) {
+      const devLevel = String(devReputation?.risk_level || "none").toLowerCase();
+      if (score < 25 || devLevel === "critical") return "Critical";
+      if (score < 40 || devLevel === "high") return "High";
+      if (score < 55 || devLevel === "medium") return "Medium";
+      if (score < 70 || devLevel === "low") return "Low";
+      return "None";
+    }
+    assert.strictEqual(computeRiskRank(90, { risk_level: "critical" }), "Critical");
+  });
+
+  await test("computeRiskRank returns all intermediate levels correctly", () => {
+    function computeRiskRank(score, devReputation) {
+      const devLevel = String(devReputation?.risk_level || "none").toLowerCase();
+      if (score < 25 || devLevel === "critical") return "Critical";
+      if (score < 40 || devLevel === "high") return "High";
+      if (score < 55 || devLevel === "medium") return "Medium";
+      if (score < 70 || devLevel === "low") return "Low";
+      return "None";
+    }
+    assert.strictEqual(computeRiskRank(35, null), "High");
+    assert.strictEqual(computeRiskRank(50, null), "Medium");
+    assert.strictEqual(computeRiskRank(65, null), "Low");
+  });
+
+  // ── Callback data size tests ─────────────────────────────────────────────────
+  console.log("\nCALLBACK DATA VALIDATION");
+
+  await test("makeShortCallback produces callback data under 64 bytes", () => {
+    const callbackStore = new Map();
+    function makeShortCallback(action, payload) {
+      const id = Math.random().toString(36).slice(2, 9);
+      callbackStore.set(id, payload);
+      return `${action}:${id}`;
+    }
+    const cb = makeShortCallback("watchadd", { chainId: "solana", tokenAddress: "7tuPcPMUoDUxxb1j1NPjyjLXaqDwmxaW7mA2Y8Mbpump" });
+    assert.ok(Buffer.byteLength(cb, "utf8") <= 64, `Callback "${cb}" exceeds 64 bytes`);
+  });
+
+  await test("all short callback action names produce data under 64 bytes", () => {
+    const callbackStore = new Map();
+    function makeShortCallback(action, payload) {
+      const id = Math.random().toString(36).slice(2, 9);
+      callbackStore.set(id, payload);
+      return `${action}:${id}`;
+    }
+    const actions = ["watchadd", "feedbackgood", "feedbackbad", "wopen", "wrescan", "wremove", "sdirect"];
+    for (const action of actions) {
+      const cb = makeShortCallback(action, { chainId: "solana", tokenAddress: "7tuPcPMUoDUxxb1j1NPjyjLXaqDwmxaW7mA2Y8Mbpump" });
+      assert.ok(
+        Buffer.byteLength(cb, "utf8") <= 64,
+        `Action "${action}" produces callback "${cb}" (${Buffer.byteLength(cb, "utf8")} bytes) exceeding 64-byte limit`
+      );
+    }
+  });
+
+  // ── Instance lock tests ──────────────────────────────────────────────────────
+  console.log("\nINSTANCE LOCK");
+
+  await test("instance lock can be acquired on empty table", async () => {
+    const { run, get, close } = makeDb();
+    await run(`CREATE TABLE IF NOT EXISTS instance_lock (
+      id INTEGER PRIMARY KEY CHECK (id = 1),
+      locked_at INTEGER NOT NULL,
+      expires_at INTEGER NOT NULL
+    )`);
+
+    const nowTs = () => Math.floor(Date.now() / 1000);
+    const INSTANCE_LOCK_TTL_MINUTES = 720;
+
+    async function acquireInstanceLock() {
+      const now = nowTs();
+      const expiresAt = now + INSTANCE_LOCK_TTL_MINUTES * 60;
+      try {
+        await run(`INSERT INTO instance_lock (id, locked_at, expires_at) VALUES (1, ?, ?)`, [now, expiresAt]);
+        return true;
+      } catch (_) {
+        const existing = await get(`SELECT * FROM instance_lock WHERE id = 1`);
+        if (!existing) return true;
+        if (existing.expires_at < now) {
+          await run(`UPDATE instance_lock SET locked_at = ?, expires_at = ? WHERE id = 1`, [now, expiresAt]);
+          return true;
+        }
+        return false;
+      }
+    }
+
+    const result = await acquireInstanceLock();
+    assert.strictEqual(result, true, "Should acquire lock on empty table");
+
+    const row = await get(`SELECT * FROM instance_lock WHERE id = 1`);
+    assert.ok(row, "Lock row should exist");
+    assert.ok(row.expires_at > nowTs(), "Lock should not be expired");
+
+    await close();
+  });
+
+  await test("instance lock is denied when an active lock exists", async () => {
+    const { run, get, close } = makeDb();
+    await run(`CREATE TABLE IF NOT EXISTS instance_lock (
+      id INTEGER PRIMARY KEY CHECK (id = 1),
+      locked_at INTEGER NOT NULL,
+      expires_at INTEGER NOT NULL
+    )`);
+
+    const nowTs = () => Math.floor(Date.now() / 1000);
+    const INSTANCE_LOCK_TTL_MINUTES = 720;
+
+    async function acquireInstanceLock() {
+      const now = nowTs();
+      const expiresAt = now + INSTANCE_LOCK_TTL_MINUTES * 60;
+      try {
+        await run(`INSERT INTO instance_lock (id, locked_at, expires_at) VALUES (1, ?, ?)`, [now, expiresAt]);
+        return true;
+      } catch (_) {
+        const existing = await get(`SELECT * FROM instance_lock WHERE id = 1`);
+        if (!existing) return true;
+        if (existing.expires_at < now) {
+          await run(`UPDATE instance_lock SET locked_at = ?, expires_at = ? WHERE id = 1`, [now, expiresAt]);
+          return true;
+        }
+        return false;
+      }
+    }
+
+    // First acquire
+    const first = await acquireInstanceLock();
+    assert.strictEqual(first, true);
+
+    // Second attempt should fail
+    const second = await acquireInstanceLock();
+    assert.strictEqual(second, false, "Second instance should not acquire lock");
+
+    await close();
+  });
+
+  await test("instance lock can be taken over when expired", async () => {
+    const { run, get, close } = makeDb();
+    await run(`CREATE TABLE IF NOT EXISTS instance_lock (
+      id INTEGER PRIMARY KEY CHECK (id = 1),
+      locked_at INTEGER NOT NULL,
+      expires_at INTEGER NOT NULL
+    )`);
+
+    const nowTs = () => Math.floor(Date.now() / 1000);
+
+    async function acquireWithTTL(ttlMinutes) {
+      const now = nowTs();
+      const expiresAt = now + ttlMinutes * 60;
+      try {
+        await run(`INSERT INTO instance_lock (id, locked_at, expires_at) VALUES (1, ?, ?)`, [now, expiresAt]);
+        return true;
+      } catch (_) {
+        const existing = await get(`SELECT * FROM instance_lock WHERE id = 1`);
+        if (!existing) return true;
+        if (existing.expires_at < now) {
+          await run(`UPDATE instance_lock SET locked_at = ?, expires_at = ? WHERE id = 1`, [now, expiresAt]);
+          return true;
+        }
+        return false;
+      }
+    }
+
+    // Insert an already-expired lock (TTL of -1 minutes = expired 60s ago)
+    const now = nowTs();
+    await run(`INSERT INTO instance_lock (id, locked_at, expires_at) VALUES (1, ?, ?)`, [now - 120, now - 60]);
+
+    // Should be able to take over expired lock
+    const result = await acquireWithTTL(720);
+    assert.strictEqual(result, true, "Should take over an expired lock");
+
+    await close();
+  });
+
+  // ────────────────────────────────────────────────────────────────────────────
 
   summary();
 }
