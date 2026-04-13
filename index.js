@@ -46,6 +46,12 @@ if (!BOT_TOKEN) {
   process.exit(1);
 }
 
+// Suppress node-telegram-bot-api content-type deprecation warning.
+// Setting NTBA_FIX_350 opts into the new file-send behavior where
+// content-type defaults to "application/octet-stream" instead of
+// triggering a DeprecationWarning on every file send.
+process.env.NTBA_FIX_350 = 1;
+
 // ================= CONFIG =================
 const DEX_TIMEOUT_MS = 6000;
 const HELIUS_TIMEOUT_MS = 7000;
@@ -68,8 +74,10 @@ const EVM_CHAIN_IDS = {
 // ================= GLOBALS =================
 const largestAccountsCache = new Map();
 const LARGEST_ACCOUNTS_TTL_MS = 60000;
+const liquidityLockCache = new Map();
+const LIQUIDITY_LOCK_TTL_MS = 300000;
 const db = new sqlite3.Database(DB_PATH);
-const bot = new TelegramBot(BOT_TOKEN, { polling: true });
+const bot = new TelegramBot(BOT_TOKEN, { polling: ENABLE_POLLING });
 const pendingAction = new Map();
 const sessionMemory = new Map();
 let BOT_USERNAME = "";
@@ -95,6 +103,8 @@ function isDevMode() {
 
 const DEV_MODE = isDevMode();
 const OWNER_USER_ID = process.env.OWNER_USER_ID || "";
+const ENABLE_POLLING = process.env.ENABLE_POLLING !== "false";
+const INSTANCE_LOCK_TTL_MINUTES = Math.max(1, parseInt(process.env.INSTANCE_LOCK_TTL_MINUTES || "720", 10));
 
 // ================= DB HELPERS =================
 function getSessionMemory(chatId) {
@@ -116,16 +126,34 @@ function updateSessionMemory(chatId, patch) {
   });
 }
 
+const CALLBACK_MAX_BYTES = 64;
+
 function makeShortCallback(action, payload) {
-  const id = Math.random().toString(36).slice(2, 10);
+  const id = Math.random().toString(36).slice(2, 9);
   callbackStore.set(id, payload);
-  return `${action}:${id}`;
+  const cb = `${action}:${id}`;
+  return cb;
 }
 
 function getShortCallbackPayload(data) {
   const parts = String(data || "").split(":");
   const id = parts[1] || "";
   return callbackStore.get(id) || null;
+}
+
+/**
+ * Returns data unchanged if it fits in CALLBACK_MAX_BYTES, otherwise stores
+ * payload in callbackStore and returns a short reference.
+ */
+function safeCallbackData(data, fallbackPayload = null) {
+  if (Buffer.byteLength(data, "utf8") <= CALLBACK_MAX_BYTES) return data;
+  if (fallbackPayload === null) {
+    // Truncate as last resort (should not happen with proper usage)
+    return data.slice(0, CALLBACK_MAX_BYTES);
+  }
+  const id = Math.random().toString(36).slice(2, 9);
+  callbackStore.set(id, fallbackPayload);
+  return `sc:${id}`;
 }
 function run(sql, params = []) {
   return new Promise((resolve, reject) => {
@@ -400,6 +428,40 @@ async function initDb() {
       ts         INTEGER NOT NULL
     )
   `);
+
+  // ── New feature tables ────────────────────────────────────────────────────
+  await run(`
+    CREATE TABLE IF NOT EXISTS flagged_wallets (
+      wallet_address TEXT    NOT NULL,
+      chain_id       TEXT    NOT NULL DEFAULT 'solana',
+      risk_level     TEXT    NOT NULL DEFAULT 'low',
+      reason         TEXT    DEFAULT '',
+      reported_by    TEXT    DEFAULT '',
+      reports_count  INTEGER DEFAULT 1,
+      last_updated   INTEGER NOT NULL,
+      created_at     INTEGER NOT NULL,
+      PRIMARY KEY (wallet_address, chain_id)
+    )
+  `);
+
+  await run(`
+    CREATE TABLE IF NOT EXISTS liquidity_lock_cache (
+      chain_id     TEXT    NOT NULL,
+      pair_address TEXT    NOT NULL,
+      is_locked    INTEGER DEFAULT NULL,
+      lock_details TEXT    DEFAULT '',
+      checked_at   INTEGER NOT NULL,
+      PRIMARY KEY (chain_id, pair_address)
+    )
+  `);
+
+  await run(`
+    CREATE TABLE IF NOT EXISTS instance_lock (
+      id         INTEGER PRIMARY KEY CHECK (id = 1),
+      locked_at  INTEGER NOT NULL,
+      expires_at INTEGER NOT NULL
+    )
+  `);
 }
 
 // ================= BASIC HELPERS =================
@@ -444,7 +506,148 @@ async function fetchHeliusTokenLargestAccounts(mint) {
 
   return [];
 }
-function nowTs() {
+
+async function fetchLiquidityLockStatus(pair) {
+  const chainId = String(pair?.chainId || "").toLowerCase();
+  const pairAddress = String(pair?.pairAddress || "").trim();
+  if (!pairAddress) return { status: "unknown", label: "🔐 ❓ Unknown" };
+
+  const cacheKey = `${chainId}:${pairAddress}`;
+  const now = Date.now();
+  const cached = liquidityLockCache.get(cacheKey);
+  if (cached && (now - cached.ts < LIQUIDITY_LOCK_TTL_MS)) {
+    return cached.result;
+  }
+
+  let result = { status: "unknown", label: "🔐 ❓ Unknown" };
+
+  try {
+    if (chainId === "solana") {
+      // Known Solana LP lock program IDs (Raydium locker, Orca locker, etc.)
+      const SOLANA_LOCK_PROGRAMS = [
+        "LockrWmn6K5twhz3y9w1dQERbmgSaRkfnTeTKbpofwE", // Raydium LP Locker
+        "FLock1h2o1h12hf32h1b9Q1h8h2f3h2f3e4g5h6j7k8" // placeholder — extend as needed
+      ];
+      const res = await axios.post(
+        HELIUS_RPC_URL,
+        {
+          jsonrpc: "2.0",
+          id: "lp-lock-check",
+          method: "getTokenLargestAccounts",
+          params: [pairAddress]
+        },
+        { timeout: 4000 }
+      );
+      const accounts = res.data?.result?.value || [];
+      const locked = accounts.some((acc) =>
+        SOLANA_LOCK_PROGRAMS.includes(acc.address)
+      );
+      result = locked
+        ? { status: "locked", label: "🔐 ✅ Locked - Passed" }
+        : { status: "unlocked", label: "🔐 ❌ Unlocked - Failed" };
+    } else if (isEvmChain(chainId)) {
+      // Known EVM LP locker contract addresses (Unicrypt, Team Finance, etc.)
+      const EVM_LOCK_CONTRACTS = [
+        "0x663a5c229c09b049e36dcc11a9b0d4a8eb9db214", // Unicrypt v2
+        "0xdba68f07d1b7ca219f78ae8582c213d975c25caf", // Team Finance
+        "0x71B5759d73262FBb223956913ecF4ecC51057641"  // PinkLock
+      ];
+      const chainNum = EVM_CHAIN_IDS[chainId];
+      if (chainNum && ETHERSCAN_API_KEY) {
+        // Check if LP token's top holders include a known locker address
+        const url = `${ETHERSCAN_V2_URL}?chainid=${chainNum}&module=token&action=tokenholderlist&contractaddress=${encodeURIComponent(pairAddress)}&page=1&offset=10&apikey=${ETHERSCAN_API_KEY}`;
+        const res = await axios.get(url, { timeout: 4000 });
+        const holders = res.data?.result || [];
+        const locked = Array.isArray(holders) && holders.some((h) =>
+          EVM_LOCK_CONTRACTS.includes(String(h.TokenHolderAddress || "").toLowerCase())
+        );
+        result = locked
+          ? { status: "locked", label: "🔐 ✅ Locked - Passed" }
+          : { status: "unlocked", label: "🔐 ❌ Unlocked - Failed" };
+      }
+    }
+  } catch (_) {
+    // Gracefully fall back to unknown on any error
+    result = { status: "unknown", label: "🔐 ❓ Unknown" };
+  }
+
+  liquidityLockCache.set(cacheKey, { ts: now, result });
+  return result;
+}
+
+async function checkDevWalletReputation(walletAddress, chainId) {
+  if (!walletAddress) return null;
+  try {
+    const row = await get(
+      `SELECT * FROM flagged_wallets WHERE wallet_address = ? AND (chain_id = ? OR chain_id = 'all') LIMIT 1`,
+      [String(walletAddress).toLowerCase(), String(chainId || "").toLowerCase()]
+    );
+    return row || null;
+  } catch (_) {
+    return null;
+  }
+}
+
+function computeRiskRank(score, devReputation, liquidityLockStatus) {
+  // Start from the safety score and apply modifiers
+  // Critical: score < 25 OR dev is critical
+  // High: score < 40 OR dev is high
+  // Medium: score < 55 OR dev is medium
+  // Low: score < 70
+  // None: score >= 70
+
+  const devLevel = String(devReputation?.risk_level || "none").toLowerCase();
+
+  if (score < 25 || devLevel === "critical") return "Critical";
+  if (score < 40 || devLevel === "high") return "High";
+  if (score < 55 || devLevel === "medium") return "Medium";
+  if (score < 70 || devLevel === "low") return "Low";
+  return "None";
+}
+
+function riskRankEmoji(rank) {
+  switch (rank) {
+    case "None":     return "🟢 None";
+    case "Low":      return "🟡 Low";
+    case "Medium":   return "🟠 Medium";
+    case "High":     return "🔴 High";
+    case "Critical": return "⛔ Critical";
+    default:         return "❓ Unknown";
+  }
+}
+
+async function acquireInstanceLock() {
+  const now = nowTs();
+  const expiresAt = now + INSTANCE_LOCK_TTL_MINUTES * 60;
+  try {
+    // Try to insert lock row (id=1). If it already exists, check if it's expired.
+    await run(
+      `INSERT INTO instance_lock (id, locked_at, expires_at) VALUES (1, ?, ?)`,
+      [now, expiresAt]
+    );
+    return true;
+  } catch (_) {
+    // Row exists — check if expired
+    const existing = await get(`SELECT * FROM instance_lock WHERE id = 1`);
+    if (!existing) return true; // shouldn't happen
+    if (existing.expires_at < now) {
+      // Expired lock — take over
+      await run(
+        `UPDATE instance_lock SET locked_at = ?, expires_at = ? WHERE id = 1`,
+        [now, expiresAt]
+      );
+      return true;
+    }
+    return false; // Another instance holds the lock
+  }
+}
+
+async function releaseInstanceLock() {
+  try {
+    await run(`DELETE FROM instance_lock WHERE id = 1`);
+  } catch (_) {}
+}
+
   return Math.floor(Date.now() / 1000);
 }
 
@@ -1046,7 +1249,7 @@ function buildAlertCenterMenu(settings) {
 }
 
 function buildWatchlistItemCallback(chainId, tokenAddress) {
-  return `watch_open:${String(chainId)}:${String(tokenAddress)}`;
+  return makeShortCallback("wopen", { chainId: String(chainId), tokenAddress: String(tokenAddress) });
 }
 
 function buildWatchlistMenu(rows) {
@@ -1062,16 +1265,20 @@ function buildWatchlistMenu(rows) {
 }
 
 function buildWatchlistItemMenu(pair) {
+  const rescanCb  = makeShortCallback("wrescan",  { chainId: pair.chainId, tokenAddress: pair.baseAddress });
+  const removeCb  = makeShortCallback("wremove",  { chainId: pair.chainId, tokenAddress: pair.baseAddress });
+  const feedGoodCb = makeShortCallback("feedbackgood", { chainId: pair.chainId, tokenAddress: pair.baseAddress });
+  const feedBadCb  = makeShortCallback("feedbackbad",  { chainId: pair.chainId, tokenAddress: pair.baseAddress });
   return {
     reply_markup: {
       inline_keyboard: [
-        [{ text: "🔁 Re-Scan", callback_data: `watch_rescan:${pair.chainId}:${pair.baseAddress}` }],
-        [{ text: "❌ Remove", callback_data: `watch_remove:${pair.chainId}:${pair.baseAddress}` }],
+        [{ text: "🔁 Re-Scan", callback_data: rescanCb }],
+        [{ text: "❌ Remove", callback_data: removeCb }],
         [
-          { text: "👍 Good Call", callback_data: `feedback:good:${pair.chainId}:${pair.baseAddress}` },
-          { text: "👎 Bad Call", callback_data: `feedback:bad:${pair.chainId}:${pair.baseAddress}` }
+          { text: "👍 Good Call", callback_data: feedGoodCb },
+          { text: "👎 Bad Call", callback_data: feedBadCb }
         ],
-        [{ text: "🔄 Refresh", callback_data: `watch_rescan:${pair.chainId}:${pair.baseAddress}` }],
+        [{ text: "🔄 Refresh", callback_data: rescanCb }],
         [{ text: "👁 Watchlist", callback_data: "watchlist" }],
         [{ text: "🏠 Main Menu", callback_data: "main_menu" }]
       ]
@@ -1174,6 +1381,7 @@ function buildSignalListButtons(items, refreshKey) {
 
   for (const pair of items) {
     const dexUrl = makeDexUrl(pair.chainId, pair.pairAddress, pair.url);
+    const scanCb = makeShortCallback("sdirect", { chainId: pair.chainId, tokenAddress: pair.baseAddress });
 
     rows.push([
       { text: `📈 ${clip(pair.baseSymbol || "Token", 18)}`, url: dexUrl },
@@ -1181,7 +1389,7 @@ function buildSignalListButtons(items, refreshKey) {
     ]);
 
     rows.push([
-      { text: "🔎 Full Scan", callback_data: `scan_direct:${pair.chainId}:${pair.baseAddress}` }
+      { text: "🔎 Full Scan", callback_data: scanCb }
     ]);
   }
 
@@ -1921,6 +2129,18 @@ const [honeypotData, topHoldersData, etherscanData] = await Promise.all([
 
   const confidenceMeta = buildConfidenceMeta(sourceChecks, behavior.penalty);
 
+  // Liquidity lock status (fetched with timeout to avoid hanging)
+  let liquidityLock = { status: "unknown", label: "🔐 ❓ Unknown" };
+  try {
+    liquidityLock = await Promise.race([
+      fetchLiquidityLockStatus(pair),
+      new Promise((_, rej) => setTimeout(() => rej(new Error("timeout")), 5000))
+    ]);
+  } catch (_) {}
+
+  // Dev wallet reputation check
+  const devReputation = await checkDevWalletReputation(pair.baseAddress, chain);
+
   let score =
     liquidity.score +
     age.score +
@@ -1931,6 +2151,19 @@ const [honeypotData, topHoldersData, etherscanData] = await Promise.all([
     holderScore -
     behavior.penalty;
 
+  // Liquidity lock modifier
+  if (liquidityLock.status === "locked")   score += 4;
+  if (liquidityLock.status === "unlocked") score -= 3;
+
+  // Dev wallet penalty
+  if (devReputation) {
+    const devLevel = String(devReputation.risk_level || "").toLowerCase();
+    if (devLevel === "low")      score -= 3;
+    else if (devLevel === "medium")   score -= 6;
+    else if (devLevel === "high")     score -= 9;
+    else if (devLevel === "critical") score -= 12;
+  }
+
   if (mode === "aggressive") score += 3;
   if (mode === "guardian") score -= 3;
 
@@ -1940,6 +2173,8 @@ const [honeypotData, topHoldersData, etherscanData] = await Promise.all([
   if (score >= 75) grade = "Strong";
   else if (score >= 55) grade = "Constructive";
   else if (score < 35) grade = "Danger";
+
+  const riskRank = computeRiskRank(score, devReputation, liquidityLock);
 
   const recommendation = buildRecommendation(score, ageMin, pair, {
     isHoneypot,
@@ -1966,7 +2201,10 @@ const [honeypotData, topHoldersData, etherscanData] = await Promise.all([
     confidenceMeta,
     behavior,
     buyTax,
-    sellTax
+    sellTax,
+    liquidityLock,
+    devReputation,
+    riskRank
   };
 }
 
@@ -1991,7 +2229,10 @@ async function buildScanCard(pair, heading, userId = null) {
     `🎯 <b>Confidence:</b> ${escapeHtml(verdict.confidenceMeta.confidence)} (${escapeHtml(verdict.confidenceMeta.checksText)})`,
     verdict.confidenceMeta.confidence === "Low" ? `⚠️ <i>Limited data available — token may be too new or partially indexed.</i>` : ``,
     ``,
+    `⚠️ <b>Risk Rank:</b> ${escapeHtml(riskRankEmoji(verdict.riskRank))}`,
+    ``,
     `💧 <b>Liquidity:</b> ${shortUsd(pair.liquidityUsd)} • ${escapeHtml(verdict.liquidity.label)}`,
+    `${escapeHtml(verdict.liquidityLock.label)}`,
     `📊 <b>24H Volume:</b> ${shortUsd(pair.volumeH24)} • ${escapeHtml(verdict.volume.label)}`,
     `⚡ <b>Flow:</b> ${escapeHtml(verdict.flow.label)} | Buys ${num(pair.buysM5)} / Sells ${num(pair.sellsM5)}`,
     `⏳ <b>Age:</b> ${escapeHtml(ageFromMs(pair.pairCreatedAt))} • ${escapeHtml(verdict.age.label)}`,
@@ -2001,6 +2242,9 @@ async function buildScanCard(pair, heading, userId = null) {
     `🧪 <b>Trap / Honeypot:</b> ${escapeHtml(verdict.honeypotLabel)}`,
     `👥 <b>Holder Structure:</b> ${escapeHtml(verdict.holderLabel)}`,
     `🧠 <b>Behavior:</b> ${escapeHtml(verdict.behavior.detail)}`,
+    verdict.devReputation
+      ? `🚩 <b>Dev Wallet:</b> ${escapeHtml(verdict.devReputation.risk_level.toUpperCase())} — ${escapeHtml(verdict.devReputation.reason || "Flagged in scam database")}`
+      : ``,
     ``,
     `📌 <b>Recommendation:</b> ${escapeHtml(verdict.recommendation)}`,
     ``,
@@ -2905,6 +3149,13 @@ bot.on("callback_query", async (query) => {
   return await runTokenScan(chatId, tokenAddress, userId);
 }
 
+  if (data.startsWith("wrescan:")) {
+    const payload = getShortCallbackPayload(data);
+    await answerCallbackSafe(query.id);
+    if (!payload) return sendText(chatId, `Callback expired. Please rescan the token.`, buildMainMenuOnlyButton());
+    return runTokenScan(chatId, payload.tokenAddress, userId);
+  }
+
     await answerCallbackSafe(query.id);
 
     if (data === "main_menu") return showMainMenu(chatId);
@@ -3080,6 +3331,12 @@ So if a token is high on Dex but lower here, that usually means the terminal thi
       const [, chainId, tokenAddress] = data.split(":");
       return runTokenScan(chatId, tokenAddress, userId);
     }
+
+    if (data.startsWith("sdirect:")) {
+      const payload = getShortCallbackPayload(data);
+      if (!payload) return sendText(chatId, `Callback expired. Please rescan the token.`, buildMainMenuOnlyButton());
+      return runTokenScan(chatId, payload.tokenAddress, userId);
+    }
 if (data.startsWith("watchadd:")) {
   const payload = getShortCallbackPayload(data);
   if (!payload) {
@@ -3153,6 +3410,12 @@ if (data.startsWith("feedbackbad:")) {
       return handleWatchOpen(chatId, userId, chainId, tokenAddress);
     }
 
+    if (data.startsWith("wopen:")) {
+      const payload = getShortCallbackPayload(data);
+      if (!payload) return sendText(chatId, `Callback expired. Please try again.`, buildMainMenuOnlyButton());
+      return handleWatchOpen(chatId, userId, payload.chainId, payload.tokenAddress);
+    }
+
   
 if (data.startsWith("watch_remove:")) {
   const [, chainId, tokenAddress] = data.split(":");
@@ -3160,6 +3423,13 @@ if (data.startsWith("watch_remove:")) {
     return sendText(chatId, `Invalid removal data.`, buildMainMenuOnlyButton("refresh:watchlist"));
   }
   await removeWatchlistItem(chatId, chainId, tokenAddress);
+  return showWatchlist(chatId);
+}
+
+if (data.startsWith("wremove:")) {
+  const payload = getShortCallbackPayload(data);
+  if (!payload) return sendText(chatId, `Callback expired. Please try again.`, buildMainMenuOnlyButton("refresh:watchlist"));
+  await removeWatchlistItem(chatId, payload.chainId, payload.tokenAddress);
   return showWatchlist(chatId);
 }if (data.startsWith("feedback:")) {
   const parts = data.split(":");
@@ -3198,6 +3468,35 @@ if (data.startsWith("watch_remove:")) {
 (async () => {
   try {
     await initDb();
+
+    // ── Instance lock check (prevents 409 Conflict from multiple bots) ─────
+    if (ENABLE_POLLING) {
+      const lockAcquired = await acquireInstanceLock();
+      if (!lockAcquired) {
+        console.warn(
+          `[instance-lock] Another bot instance holds the lock (TTL ${INSTANCE_LOCK_TTL_MINUTES}m). ` +
+          `Set ENABLE_POLLING=false to disable polling on this instance, or wait for the lock to expire.`
+        );
+        // Don't exit — allow the process to continue without polling (e.g. for webhooks).
+        // The bot object was already created with polling:true above, so we need to stop it.
+        try { bot.stopPolling(); } catch (_) {}
+      }
+
+      // Release the lock when the process exits
+      process.once("beforeExit", releaseInstanceLock);
+    }
+
+    // ── Graceful polling-error handler (409 Conflict) ──────────────────────
+    bot.on("polling_error", (err) => {
+      const msg = String(err?.message || "");
+      if (msg.includes("409") || msg.includes("Conflict")) {
+        console.warn(`[polling_error] 409 Conflict detected — another instance may be running. Stopping polling.`);
+        try { bot.stopPolling(); } catch (_) {}
+      } else {
+        console.error(`[polling_error] ${JSON.stringify({ code: err?.code, message: msg })}`);
+      }
+    });
+
     const me = await bot.getMe();
     BOT_USERNAME = me?.username || "";
     console.log(`✅ Gorktimus online as @${BOT_USERNAME || "unknown_bot"}`);
