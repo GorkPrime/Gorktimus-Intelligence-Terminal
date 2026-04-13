@@ -141,20 +141,6 @@ function getShortCallbackPayload(data) {
   return callbackStore.get(id) || null;
 }
 
-/**
- * Returns data unchanged if it fits in CALLBACK_MAX_BYTES, otherwise stores
- * payload in callbackStore and returns a short reference.
- */
-function safeCallbackData(data, fallbackPayload = null) {
-  if (Buffer.byteLength(data, "utf8") <= CALLBACK_MAX_BYTES) return data;
-  if (fallbackPayload === null) {
-    // Truncate as last resort (should not happen with proper usage)
-    return data.slice(0, CALLBACK_MAX_BYTES);
-  }
-  const id = Math.random().toString(36).slice(2, 9);
-  callbackStore.set(id, fallbackPayload);
-  return `sc:${id}`;
-}
 function run(sql, params = []) {
   return new Promise((resolve, reject) => {
     db.run(sql, params, function (err) {
@@ -523,10 +509,10 @@ async function fetchLiquidityLockStatus(pair) {
 
   try {
     if (chainId === "solana") {
-      // Known Solana LP lock program IDs (Raydium locker, Orca locker, etc.)
+      // Known Solana LP lock program IDs.
+      // Add verified locker program addresses here as they are confirmed.
       const SOLANA_LOCK_PROGRAMS = [
-        "LockrWmn6K5twhz3y9w1dQERbmgSaRkfnTeTKbpofwE", // Raydium LP Locker
-        "FLock1h2o1h12hf32h1b9Q1h8h2f3h2f3e4g5h6j7k8" // placeholder — extend as needed
+        "LockrWmn6K5twhz3y9w1dQERbmgSaRkfnTeTKbpofwE" // Raydium LP Locker
       ];
       const res = await axios.post(
         HELIUS_RPC_URL,
@@ -2243,7 +2229,7 @@ async function buildScanCard(pair, heading, userId = null) {
     `👥 <b>Holder Structure:</b> ${escapeHtml(verdict.holderLabel)}`,
     `🧠 <b>Behavior:</b> ${escapeHtml(verdict.behavior.detail)}`,
     verdict.devReputation
-      ? `🚩 <b>Dev Wallet:</b> ${escapeHtml(verdict.devReputation.risk_level.toUpperCase())} — ${escapeHtml(verdict.devReputation.reason || "Flagged in scam database")}`
+      ? `🚩 <b>Dev Wallet:</b> ${escapeHtml((verdict.devReputation.risk_level || "").toUpperCase())} — ${escapeHtml(verdict.devReputation.reason || "Flagged in scam database")}`
       : ``,
     ``,
     `📌 <b>Recommendation:</b> ${escapeHtml(verdict.recommendation)}`,
@@ -3517,14 +3503,16 @@ if (data.startsWith("wremove:")) {
   }
 })();
 
-process.on("SIGINT", () => {
+process.on("SIGINT", async () => {
+  await releaseInstanceLock().catch(() => {});
   try {
     db.close();
   } catch (_) {}
   process.exit(0);
 });
 
-process.on("SIGTERM", () => {
+process.on("SIGTERM", async () => {
+  await releaseInstanceLock().catch(() => {});
   try {
     db.close();
   } catch (_) {}
