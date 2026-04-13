@@ -634,6 +634,7 @@ async function releaseInstanceLock() {
   } catch (_) {}
 }
 
+function nowTs() {
   return Math.floor(Date.now() / 1000);
 }
 
