@@ -1116,7 +1116,7 @@ function buildMainMenu() {
     ],
     [
       { text: "📡 Launch Radar", callback_data: "launch_radar" },
-      { text: "⭐ Prime Picks", callback_data: "prime_picks" }
+      { text: "💎 Prime Picks", callback_data: "prime_picks" }
     ],
     [
       { text: "👁 Watchlist", callback_data: "watchlist" },
