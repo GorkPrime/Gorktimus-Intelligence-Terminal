@@ -104,6 +104,7 @@ function getSessionMemory(chatId) {
   if (!sessionMemory.has(chatId)) {
     sessionMemory.set(chatId, {
       lastScan: null,
+      recentScans: [],
       lastImage: null,
       lastAIContext: null
     });
@@ -160,51 +161,77 @@ function all(sql, params = []) {
     });
   });
 }
-// Returns true when the user's message clearly refers to the previously scanned token
-function shouldUseLastScanContext(text) {
+// Returns true when the user explicitly asks about previously scanned tokens
+function shouldUseScanHistoryContext(text) {
   const lower = String(text || "").toLowerCase();
   const referencePatterns = [
-    "this token", "that token", "this coin", "that coin", "the coin",
-    "last scan", "previous scan", "the token", "the project",
-    "is it safe", "should i buy", "should i buy it", "is it legit",
-    "what about liquidity", "what about the liquidity", "what about volume",
-    "rug or not", "is it a rug", "is it a scam", "worth it",
-    "should i ape", "should i invest", "that one", "this one",
-    "what do you think about it", "what do you think of it",
-    "give me your thoughts", "analyze it", "break it down",
-    "what's the verdict", "whats the verdict", "verdict on it",
-    "run it", "check it", "scan it"
+    "last scan",
+    "previous scan",
+    "recent scan",
+    "my scans",
+    "last 3 scans",
+    "last three scans",
+    "what did i scan",
+    "what did we scan",
+    "from the scan",
+    "from my scan",
+    "that token we scanned",
+    "the token we scanned",
+    "compare my scans",
+    "compare last scans"
   ];
   return referencePatterns.some(p => lower.includes(p));
 }
 
-async function askAI({ text, chatId, imageUrl = null }) {
+function buildRecentScansContext(scans = []) {
+  if (!Array.isArray(scans) || !scans.length) return "";
+  const lines = scans.map((scan, index) => {
+    const ageMin = ageMinutesFromMs(num(scan.pair_created_at || 0));
+    return [
+      `${index + 1}. ${scan.symbol || "Unknown"} (${scan.chain_id || "unknown"})`,
+      `   Query: ${scan.query || ""}`,
+      `   Address: ${scan.token_address || ""}`,
+      `   Price: ${scan.price_usd || ""} | Liquidity: ${scan.liquidity_usd || ""} | MCap: ${scan.market_cap || ""}`,
+      `   Flow: ${scan.buys_m5 || 0}B / ${scan.sells_m5 || 0}S | Vol24h: ${scan.volume_h24 || 0} | Age: ${ageMin ? `${ageMin}m` : "unknown"}`
+    ].join("\n");
+  });
+  return `Recent scans (latest first):\n${lines.join("\n\n")}`;
+}
+
+async function askAI({ text, chatId, userId = null, imageUrl = null, mediaNote = "" }) {
   const memory = getSessionMemory(chatId);
 
   let context = "";
-  if (memory?.lastScan && shouldUseLastScanContext(text)) {
-    context = `
-Most recent scan context:
-- Query: ${memory.lastScan.query || ""}
-- Symbol: ${memory.lastScan.symbol || ""}
-- Name: ${memory.lastScan.name || ""}
-- Token Address: ${memory.lastScan.tokenAddress || ""}
-- Chain: ${memory.lastScan.chainId || ""}
-- Price: ${memory.lastScan.priceUsd || ""}
-- Liquidity: ${memory.lastScan.liquidityUsd || ""}
-- Market Cap: ${memory.lastScan.marketCap || ""}
-- Score: ${memory.lastScan.score || ""}
-- Verdict: ${memory.lastScan.verdict || ""}
-- Recommendation: ${memory.lastScan.recommendation || ""}
-`;
+  if (shouldUseScanHistoryContext(text)) {
+    let recentScans = [];
+    if (userId) {
+      recentScans = await getRecentUserScans(userId, 3);
+    } else if (Array.isArray(memory?.recentScans)) {
+      recentScans = memory.recentScans.slice(0, 3).map((scan) => ({
+        query: scan.query || "",
+        symbol: scan.symbol || "",
+        chain_id: scan.chainId || "",
+        token_address: scan.tokenAddress || "",
+        price_usd: scan.priceUsd || "",
+        liquidity_usd: scan.liquidityUsd || "",
+        market_cap: scan.marketCap || "",
+        buys_m5: scan.buysM5 || 0,
+        sells_m5: scan.sellsM5 || 0,
+        volume_h24: scan.volumeH24 || 0,
+        pair_created_at: scan.pairCreatedAt || 0
+      }));
+    }
+    context = buildRecentScansContext(recentScans);
   }
 
+  const textParts = [context, mediaNote, `User: ${text || ""}`].filter(Boolean);
+  const combinedText = textParts.join("\n\n");
   const userContent = imageUrl
     ? [
-        { type: "text", text: context + "\nUser: " + (text || "Analyze this image.") },
+        { type: "text", text: combinedText || "User: Analyze this media." },
         { type: "image_url", image_url: { url: imageUrl } }
       ]
-    : context + "\nUser: " + (text || "");
+    : combinedText;
 
   try {
     const res = await openai.chat.completions.create({
@@ -214,6 +241,11 @@ Most recent scan context:
           role: "system",
           content: `
 You are Gorktimus Prime — an elite AI crypto defense system and advisor.
+
+Primary mission:
+- Detect real market signals, not noise.
+- Prioritize structure, risk, flow quality, and manipulation clues over hype.
+- Be clear and decisive when the user asks for a token/risk read.
 
 Your personality:
 - Sharp, confident, slightly aggressive, teaching tone
@@ -239,7 +271,8 @@ Your modes (pick the right one based on what the user is asking):
 Rules:
 - Do NOT force SAFE/RISKY/DANGER on every single response
 - Only use verdict format when user is clearly asking for a risk assessment or token scan
-- If scan context is provided above, use it when the user refers to that token
+- Only use previous-scan context when it is provided above and relevant to the request
+- Never inject scan history unless the user clearly asks about previous scans/tokens
 - If no scan context is present or user asks a general question, respond conversationally
 - Never speak like generic AI — stay in character as Gorktimus Prime
 - Adapt to the user's tone and level of knowledge
@@ -344,6 +377,29 @@ async function initDb() {
       ts INTEGER
     )
   `);
+
+  await run(`
+    CREATE TABLE IF NOT EXISTS user_scan_history (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      user_id TEXT NOT NULL,
+      chat_id TEXT NOT NULL,
+      query TEXT DEFAULT '',
+      chain_id TEXT DEFAULT '',
+      token_address TEXT DEFAULT '',
+      symbol TEXT DEFAULT '',
+      name TEXT DEFAULT '',
+      price_usd REAL DEFAULT 0,
+      liquidity_usd REAL DEFAULT 0,
+      market_cap REAL DEFAULT 0,
+      buys_m5 INTEGER DEFAULT 0,
+      sells_m5 INTEGER DEFAULT 0,
+      volume_h24 REAL DEFAULT 0,
+      pair_created_at INTEGER DEFAULT 0,
+      created_at INTEGER NOT NULL
+    )
+  `);
+
+  await run(`CREATE INDEX IF NOT EXISTS idx_user_scan_history_user_ts ON user_scan_history(user_id, created_at DESC)`);
 
   await run(`
     CREATE TABLE IF NOT EXISTS pair_memory (
@@ -1123,8 +1179,7 @@ function buildMainMenu() {
       { text: "🧬 Mode Lab", callback_data: "mode_lab" }
     ],
     [
-      { text: "🚨 Alert Center", callback_data: "alert_center" },
-      { text: "🐋 Whale Tracker", callback_data: "whale_menu" }
+      { text: "🚨 Alert Center", callback_data: "alert_center" }
     ],
     [
       { text: "🧠 Edge Brain", callback_data: "edge_brain" },
@@ -1235,10 +1290,7 @@ function buildAlertCenterMenu(settings) {
           { text: `${mark(settings.launch_alerts)} Launch Alerts`, callback_data: "toggle_setting:launch_alerts" },
           { text: `${mark(settings.smart_alerts)} Smart Alerts`, callback_data: "toggle_setting:smart_alerts" }
         ],
-        [
-          { text: `${mark(settings.risk_alerts)} Risk Alerts`, callback_data: "toggle_setting:risk_alerts" },
-          { text: `${mark(settings.whale_alerts)} Whale Alerts`, callback_data: "toggle_setting:whale_alerts" }
-        ],
+        [{ text: `${mark(settings.risk_alerts)} Risk Alerts`, callback_data: "toggle_setting:risk_alerts" }],
         [{ text: "🔄 Refresh", callback_data: "refresh:alert_center" }],
         [{ text: "🏠 Main Menu", callback_data: "main_menu" }]
       ]
@@ -2361,6 +2413,44 @@ async function addScanFeedback(userId, pair, feedback, scoreSnapshot = 0) {
   );
 }
 
+async function addUserScanHistory(userId, chatId, query, pair) {
+  if (!userId || !chatId || !pair) return;
+  await run(
+    `INSERT INTO user_scan_history
+      (user_id, chat_id, query, chain_id, token_address, symbol, name, price_usd, liquidity_usd, market_cap, buys_m5, sells_m5, volume_h24, pair_created_at, created_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    [
+      String(userId),
+      String(chatId),
+      String(query || ""),
+      String(pair.chainId || ""),
+      String(pair.baseAddress || ""),
+      String(pair.baseSymbol || ""),
+      String(pair.baseName || ""),
+      num(pair.priceUsd),
+      num(pair.liquidityUsd),
+      num(pair.marketCap),
+      num(pair.buysM5),
+      num(pair.sellsM5),
+      num(pair.volumeH24),
+      num(pair.pairCreatedAt),
+      nowTs()
+    ]
+  );
+}
+
+async function getRecentUserScans(userId, limit = 3) {
+  if (!userId) return [];
+  return all(
+    `SELECT query, chain_id, token_address, symbol, name, price_usd, liquidity_usd, market_cap, buys_m5, sells_m5, volume_h24, pair_created_at, created_at
+     FROM user_scan_history
+     WHERE user_id = ?
+     ORDER BY created_at DESC
+     LIMIT ?`,
+    [String(userId), Math.max(1, num(limit))]
+  );
+}
+
 // ================= AI HELPER =================
 function buildAssistantGenericReply(prompt = "") {
   const lower = String(prompt || "").toLowerCase();
@@ -2733,8 +2823,9 @@ if (inputInfo.type === "ticker") {
   snapshotPromise.catch(() => {});
 
   await sendCard(chatId, card, buildScanActionButtons(pair, query), "");
-updateSessionMemory(chatId, {
-  lastScan: {
+  await addUserScanHistory(userId, chatId, query, pair).catch(() => {});
+  const currentMemory = getSessionMemory(chatId);
+  const scanSnapshot = {
     query,
     symbol: pair?.baseSymbol || "",
     name: pair?.baseName || "",
@@ -2742,9 +2833,17 @@ updateSessionMemory(chatId, {
     chainId: pair?.chainId || "",
     priceUsd: pair?.priceUsd || "",
     liquidityUsd: pair?.liquidityUsd || "",
-    marketCap: pair?.marketCap || ""
-     }
-});
+    marketCap: pair?.marketCap || "",
+    buysM5: pair?.buysM5 || 0,
+    sellsM5: pair?.sellsM5 || 0,
+    volumeH24: pair?.volumeH24 || 0,
+    pairCreatedAt: pair?.pairCreatedAt || 0
+  };
+  const recentScans = [scanSnapshot, ...(Array.isArray(currentMemory?.recentScans) ? currentMemory.recentScans : [])].slice(0, 3);
+  updateSessionMemory(chatId, {
+    lastScan: scanSnapshot,
+    recentScans
+  });
 }
 async function showTrending(chatId, userId = null) {
   const boosts = await fetchLatestBoosts();
@@ -3018,7 +3117,7 @@ async function handleRefresh(chatId, userId, key) {
   if (key === "mode_lab") return showModeLab(chatId, userId);
   if (key === "alert_center") return showAlertCenter(chatId, userId);
   if (key === "edge_brain") return showEdgeBrain(chatId);
-  if (key === "wallets") return showWhaleMenu(chatId);
+  if (key === "wallets") return sendText(chatId, `🧠 <b>Wallet tracker</b> has been retired.`, buildMainMenuOnlyButton("refresh:main"));
   if (key === "ai") return showAIAssistant(chatId);
   if (key === "invite") return showInviteFriends(chatId);
 }
@@ -3048,14 +3147,63 @@ async function showAIAssistant(chatId) {
     buildAIAssistantMenu()
   );
 }
-async function getTelegramPhotoUrl(photo) {
-  const best = photo[photo.length - 1];
-  if (!best?.file_id) return null;
-
-  const file = await bot.getFile(best.file_id);
+async function getTelegramFileUrl(fileId) {
+  if (!fileId) return null;
+  const file = await bot.getFile(fileId);
   if (!file?.file_path) return null;
-
   return `https://api.telegram.org/file/bot${BOT_TOKEN}/${file.file_path}`;
+}
+
+function isImageDocument(doc) {
+  const mime = String(doc?.mime_type || "").toLowerCase();
+  const name = String(doc?.file_name || "").toLowerCase();
+  return mime.startsWith("image/") || /\.(png|jpe?g|webp|gif|bmp)$/i.test(name);
+}
+
+async function getTelegramMediaContext(msg) {
+  if (Array.isArray(msg?.photo) && msg.photo.length > 0) {
+    const best = msg.photo[msg.photo.length - 1];
+    const imageUrl = await getTelegramFileUrl(best?.file_id);
+    return {
+      imageUrl,
+      mediaNote: imageUrl ? "User sent a photo. Analyze visible signal patterns and risk cues from the image." : ""
+    };
+  }
+
+  if (msg?.document?.file_id) {
+    const url = await getTelegramFileUrl(msg.document.file_id);
+    if (!url) return { imageUrl: null, mediaNote: "" };
+    if (isImageDocument(msg.document)) {
+      return {
+        imageUrl: url,
+        mediaNote: `User sent an image document (${msg.document.file_name || "file"}). Analyze visual details and extract relevant crypto signal context if present.`
+      };
+    }
+    return {
+      imageUrl: null,
+      mediaNote: `User sent a document file (${msg.document.file_name || "file"}, ${msg.document.mime_type || "unknown mime"}). If the user asks for analysis, reason using the message text and file metadata.`
+    };
+  }
+
+  if (msg?.video?.file_id) {
+    const url = await getTelegramFileUrl(msg.video.file_id);
+    return {
+      imageUrl: null,
+      mediaNote: url
+        ? `User sent a video (${msg.video.mime_type || "video"}). Use user text + metadata for guidance and ask for key frame screenshots if deeper visual analysis is needed.`
+        : "User sent a video. Use user text for analysis."
+    };
+  }
+
+  return { imageUrl: null, mediaNote: "" };
+}
+
+async function sendWhaleTrackerRetired(chatId) {
+  return sendText(
+    chatId,
+    `🧠 <b>Feature update</b>\n\nWhale Tracker has been retired to keep the terminal focused on signal detection.`,
+    buildMainMenuOnlyButton("refresh:main")
+  );
 }
 bot.on("message", async (msg) => {
   try {
@@ -3071,13 +3219,10 @@ bot.on("message", async (msg) => {
 
     const chatId = msg.chat.id;
     const cleaned = String(msg.text || msg.caption || "").trim();
-    const hasPhoto = Array.isArray(msg.photo) && msg.photo.length > 0;
-    let imageUrl = null;
-
-    if (hasPhoto) {
-      imageUrl = await getTelegramPhotoUrl(msg.photo);
-    }
-    if (!cleaned && !hasPhoto) return;
+    const media = await getTelegramMediaContext(msg);
+    const imageUrl = media.imageUrl;
+    const mediaNote = media.mediaNote;
+    if (!cleaned && !mediaNote && !imageUrl) return;
     const pending = pendingAction.get(chatId);
    
     if (pending?.type === "SCAN_TOKEN") {
@@ -3086,47 +3231,18 @@ bot.on("message", async (msg) => {
       return;
     }
 
-    if (pending?.type === "ADD_WHALE") {
-      pendingAction.set(chatId, { type: "ADD_WHALE_NAME", wallet: cleaned });
-      await sendText(chatId, `Send the nickname for this whale wallet.`, buildMainMenuOnlyButton("refresh:wallets"));
-      return;
-    }
-
-    if (pending?.type === "ADD_WHALE_NAME") {
-      const wallet = pending.wallet;
+    if (pending?.type === "ADD_WHALE" || pending?.type === "ADD_WHALE_NAME" || pending?.type === "ADD_DEV" || pending?.type === "ADD_DEV_NAME" || pending?.type === "CHECK_WALLET") {
       pendingAction.delete(chatId);
-      await addWalletTrack(chatId, wallet, "whale", cleaned || "Whale");
-      return;
-    }
-
-    if (pending?.type === "ADD_DEV") {
-      pendingAction.set(chatId, { type: "ADD_DEV_NAME", wallet: cleaned });
-      await sendText(chatId, `Send the nickname for this dev wallet.`, buildMainMenuOnlyButton("refresh:wallets"));
-      return;
-    }
-
-    if (pending?.type === "ADD_DEV_NAME") {
-      const wallet = pending.wallet;
-      pendingAction.delete(chatId);
-      await addWalletTrack(chatId, wallet, "dev", cleaned || "Dev");
-      return;
-    }
-
-    if (pending?.type === "CHECK_WALLET") {
-      pendingAction.delete(chatId);
-      await sendText(
-        chatId,
-        `🧠 <b>Wallet Check</b>\n\nWallet checks are wired as a shell right now.\nWallet: <code>${escapeHtml(cleaned)}</code>`,
-        buildMainMenuOnlyButton("refresh:wallets")
-      );
-      return;
+      return sendWhaleTrackerRetired(chatId);
     }
 
 if (pending?.type === "AI") {
   const reply = await askAI({
-    text: cleaned || "Analyze this image.",
+    text: cleaned || "Analyze this media input.",
     chatId,
-    imageUrl
+    userId: msg.from.id,
+    imageUrl,
+    mediaNote
   });
 
   await sendText(
@@ -3213,7 +3329,7 @@ bot.on("callback_query", async (query) => {
   );
 }
     if (data === "help_menu") return showHelpMenu(chatId);
-    if (data === "whale_menu") return showWhaleMenu(chatId);
+    if (data === "whale_menu") return sendWhaleTrackerRetired(chatId);
     if (data === "invite_friends") return showInviteFriends(chatId);
     if (data === "check_subscription") return showMainMenu(chatId);
     if (data === "early_access") {
@@ -3295,67 +3411,28 @@ So if a token is high on Dex but lower here, that usually means the terminal thi
       return sendText(chatId, `🧠 <b>Community</b>\n\nX: ${escapeHtml(COMMUNITY_X_URL)}\nTelegram: ${escapeHtml(COMMUNITY_TELEGRAM_URL)}`, buildHelpMenu());
     }
 
-    if (data === "add_whale") {
-      pendingAction.set(chatId, { type: "ADD_WHALE" });
-      return sendText(chatId, `Send the Solana wallet address you want to save as a whale wallet.`, buildMainMenuOnlyButton("refresh:wallets"));
+    if (data === "add_whale" || data === "add_dev" || data === "check_wallet" || data === "whale_list" || data === "dev_list" || data === "wallet_alert_settings") {
+      return sendWhaleTrackerRetired(chatId);
     }
-
-    if (data === "add_dev") {
-      pendingAction.set(chatId, { type: "ADD_DEV" });
-      return sendText(chatId, `Send the Solana wallet address you want to save as a dev wallet.`, buildMainMenuOnlyButton("refresh:wallets"));
-    }
-
-    if (data === "check_wallet") {
-      pendingAction.set(chatId, { type: "CHECK_WALLET" });
-      return sendText(chatId, `Send the wallet address you want to check.`, buildMainMenuOnlyButton("refresh:wallets"));
-    }
-
-    if (data === "whale_list") return showWalletList(chatId, "whale");
-    if (data === "dev_list") return showWalletList(chatId, "dev");
-    if (data === "wallet_alert_settings") return sendText(chatId, `🧠 <b>Wallet Alerts</b>\n\nWallet alerts are controlled through the saved wallet item toggles.`, buildMainMenuOnlyButton("refresh:wallets"));
 
     if (data.startsWith("wallet_item:")) {
-      const id = data.split(":")[1];
-      const row = await get(`SELECT * FROM wallet_tracks WHERE id = ?`, [String(id)]);
-      if (!row) return sendText(chatId, `Wallet not found.`, buildMainMenuOnlyButton("refresh:wallets"));
-      return sendText(
-        chatId,
-        `🧠 <b>Tracked Wallet</b>\n\nType: <b>${escapeHtml(row.label_type)}</b>\nName: <b>${escapeHtml(row.nickname || "Unnamed")}</b>\nWallet: <code>${escapeHtml(row.wallet)}</code>\nAlerts: <b>${row.alerts_enabled ? "On" : "Off"}</b>`,
-        buildWalletItemMenu(row)
-      );
+      return sendWhaleTrackerRetired(chatId);
     }
 
     if (data.startsWith("wallet_toggle:")) {
-  const id = data.split(":")[1];
-  await run(
-    `UPDATE wallet_tracks
-     SET alerts_enabled = CASE WHEN alerts_enabled = 1 THEN 0 ELSE 1 END,
-         updated_at = ?
-     WHERE id = ?`,
-    [nowTs(), String(id)]
-  );
-  return showWhaleMenu(chatId);
+  return sendWhaleTrackerRetired(chatId);
 }
 
     if (data.startsWith("wallet_remove:")) {
-      const id = data.split(":")[1];
-      await run(`DELETE FROM wallet_tracks WHERE id = ?`, [String(id)]);
-      return showWhaleMenu(chatId);
+      return sendWhaleTrackerRetired(chatId);
     }
 
     if (data.startsWith("wallet_check:")) {
-      const id = data.split(":")[1];
-      const row = await get(`SELECT * FROM wallet_tracks WHERE id = ?`, [String(id)]);
-      if (!row) return sendText(chatId, `Wallet not found.`, buildMainMenuOnlyButton("refresh:wallets"));
-      return sendText(
-        chatId,
-        `🧠 <b>Wallet Check</b>\n\nWallet: <code>${escapeHtml(row.wallet)}</code>\nThis shell is active. Add your preferred wallet intelligence flow here next.`,
-        buildWalletItemMenu(row)
-      );
+      return sendWhaleTrackerRetired(chatId);
     }
 
     if (data.startsWith("wallet_rename:")) {
-      return sendText(chatId, `Rename flow can be added next.`, buildMainMenuOnlyButton("refresh:wallets"));
+      return sendWhaleTrackerRetired(chatId);
     }
 
     if (data.startsWith("set_mode:")) {
