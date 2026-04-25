@@ -9,6 +9,7 @@ const THIRTY_MINUTES_MS = 30 * 60 * 1000;
 const THIRTY_DAYS_S = 30 * 24 * 60 * 60;
 const MAX_MESSAGE_LENGTH = 2000;
 const MAX_STACK_LENGTH = 4000;
+const CRITICAL_ERROR_THRESHOLD = 10; // recent errors in 30 min that trigger a critical alert
 
 // Severity levels used when logging errors
 const SEVERITY = {
@@ -211,7 +212,7 @@ function initHealthMonitor({ bot, run, get, callbackStore, sessionMemory, ownerU
     } catch (_) {}
 
     // Alert the owner if the error rate is elevated or tables failed
-    const isCritical = recentErrors >= 10 || !tablesOk;
+    const isCritical = recentErrors >= CRITICAL_ERROR_THRESHOLD || !tablesOk;
     if (isCritical) {
       await logError(scanNotes, "", SEVERITY.CRITICAL);
       await alertOwner(

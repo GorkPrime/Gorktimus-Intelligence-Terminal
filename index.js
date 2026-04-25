@@ -3746,9 +3746,14 @@ async function runLaunchRadarAlerts() {
       (dexUrl ? `\n   🔗 ${dexUrl}` : "")
     );
     // scan_direct:chainId:tokenAddress — handled by the callback router without
-    // callbackStore so it never expires.
-    const scanCb = `scan_direct:${pair.chainId}:${pair.baseAddress}`;
-    tokenRows.push([{ text: `🔎 Scan ${escapeHtml(pair.baseSymbol || shortAddr(pair.baseAddress, 4))}`, callback_data: scanCb }]);
+    // callbackStore so it never expires.  Strip any colons from the address as a
+    // safety measure (Solana base58 and EVM hex addresses never contain colons,
+    // but this ensures the split(":") in the callback router always works).
+    const safeAddress = String(pair.baseAddress || "").replace(/:/g, "");
+    const safeChain = String(pair.chainId || "").replace(/:/g, "");
+    const scanCb = `scan_direct:${safeChain}:${safeAddress}`;
+    const buttonLabel = pair.baseSymbol ? `🔎 Scan ${pair.baseSymbol}` : `🔎 Scan ${shortAddr(pair.baseAddress, 4)}`;
+    tokenRows.push([{ text: buttonLabel, callback_data: scanCb }]);
   }
 
   lines.push(``, `Tap a Scan button below to run a full analysis on any of these tokens.`);
