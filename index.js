@@ -393,12 +393,12 @@ async function initDb() {
     CREATE TABLE IF NOT EXISTS user_settings (
       user_id TEXT PRIMARY KEY,
       mode TEXT DEFAULT 'balanced',
-      alerts_enabled INTEGER DEFAULT 1,
-      launch_alerts INTEGER DEFAULT 1,
-      smart_alerts INTEGER DEFAULT 1,
-      risk_alerts INTEGER DEFAULT 1,
-      whale_alerts INTEGER DEFAULT 1,
-      watchlist_alerts INTEGER DEFAULT 1,
+      alerts_enabled INTEGER DEFAULT 0,
+      launch_alerts INTEGER DEFAULT 0,
+      smart_alerts INTEGER DEFAULT 0,
+      risk_alerts INTEGER DEFAULT 0,
+      whale_alerts INTEGER DEFAULT 0,
+      watchlist_alerts INTEGER DEFAULT 0,
       explanation_level TEXT DEFAULT 'deep',
       last_scan_query TEXT DEFAULT '',
       created_at INTEGER NOT NULL,
@@ -517,7 +517,7 @@ async function initDb() {
   } catch (_) {}
 
   try {
-    await run(`ALTER TABLE user_settings ADD COLUMN watchlist_alerts INTEGER DEFAULT 1`);
+    await run(`ALTER TABLE user_settings ADD COLUMN watchlist_alerts INTEGER DEFAULT 0`);
   } catch (_) {}
 
   // ── Health monitoring tables ─────────────────────────────────────────────
@@ -1112,12 +1112,12 @@ async function getUserSettings(userId) {
   return row || {
     user_id: String(userId),
     mode: "balanced",
-    alerts_enabled: 1,
-    launch_alerts: 1,
-    smart_alerts: 1,
-    risk_alerts: 1,
-    whale_alerts: 1,
-    watchlist_alerts: 1,
+    alerts_enabled: 0,
+    launch_alerts: 0,
+    smart_alerts: 0,
+    risk_alerts: 0,
+    whale_alerts: 0,
+    watchlist_alerts: 0,
     explanation_level: "deep",
     last_scan_query: ""
   };
@@ -3696,6 +3696,13 @@ async function runLaunchRadarAlerts() {
 
   if (!userRows.length) return;
 
+  // In dev mode, restrict alerts to the owner only so test runs don't spam real users
+  const alertTargets = DEV_MODE
+    ? userRows.filter(row => String(row.chat_id) === OWNER_USER_ID)
+    : userRows;
+
+  if (!alertTargets.length) return;
+
   const profiles = await fetchLatestProfiles().catch(() => []);
   const now = Date.now();
   const newLaunches = [];
@@ -3768,13 +3775,13 @@ async function runLaunchRadarAlerts() {
     }
   };
 
-  for (const row of userRows) {
+  for (const row of alertTargets) {
     if (!row.chat_id) continue;
     await sendText(String(row.chat_id), alertText, alertKeyboard).catch(() => {});
     await sleep(ALERT_SEND_DELAY_MS);
   }
 
-  console.log(`[launch-radar-alerts] Alerted ${userRows.length} user(s) about ${newLaunches.length} new launch(es)`);
+  console.log(`[launch-radar-alerts] Alerted ${alertTargets.length} user(s) about ${newLaunches.length} new launch(es)`);
 }
 
 /**
@@ -3800,7 +3807,14 @@ async function runWatchlistMonitor() {
 
   if (!items.length) return;
 
-  for (const item of items) {
+  // In dev mode, restrict watchlist alerts to the owner only
+  const monitorItems = DEV_MODE
+    ? items.filter(item => String(item.chat_id) === OWNER_USER_ID)
+    : items;
+
+  if (!monitorItems.length) return;
+
+  for (const item of monitorItems) {
     try {
       if (nowSec - num(item.last_alert_ts) < WATCHLIST_ALERT_COOLDOWN_S) {
         // Still in cooldown — refresh price silently

@@ -211,13 +211,17 @@ function initHealthMonitor({ bot, run, get, callbackStore, sessionMemory, ownerU
       );
     } catch (_) {}
 
-    // Alert the owner if the error rate is elevated or tables failed
+    // Alert the owner if the error rate is elevated or tables failed.
+    // System scan alerts are suppressed in dev mode to avoid false alarms
+    // during testing; they fire in production where real intervention is needed.
     const isCritical = recentErrors >= CRITICAL_ERROR_THRESHOLD || !tablesOk;
     if (isCritical) {
       await logError(scanNotes, "", SEVERITY.CRITICAL);
-      await alertOwner(
-        `⚠️ <b>Gorktimus System Scan Alert</b>\n\nRecent errors (30 min): <b>${recentErrors}</b>\nTables OK: <b>${tablesOk}</b>\n\nAuto-correction applied. Monitor for continued failures.`
-      );
+      if (!devMode) {
+        await alertOwner(
+          `⚠️ <b>Gorktimus System Scan Alert</b>\n\nRecent errors (30 min): <b>${recentErrors}</b>\nTables OK: <b>${tablesOk}</b>\n\nAuto-correction applied. Monitor for continued failures.`
+        );
+      }
     }
 
     console.log("[health-monitor] System scan complete");
