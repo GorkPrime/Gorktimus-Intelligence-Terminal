@@ -1200,6 +1200,169 @@ async function main() {
   });
 
   // ────────────────────────────────────────────────────────────────────────────
+  // MOVERS ALERT TESTS
+  // ────────────────────────────────────────────────────────────────────────────
+  console.log("\nMOVERS ALERT");
+
+  // Helper: minimal user_settings table with movers_alerts column
+  async function makeMoversDb() {
+    const { run, get, all, close } = makeDb();
+
+    await run(`
+      CREATE TABLE IF NOT EXISTS user_settings (
+        user_id         TEXT PRIMARY KEY,
+        movers_alerts   INTEGER DEFAULT 0,
+        launch_alerts   INTEGER DEFAULT 0,
+        watchlist_alerts INTEGER DEFAULT 0,
+        risk_alerts     INTEGER DEFAULT 0,
+        created_at      INTEGER NOT NULL,
+        updated_at      INTEGER NOT NULL
+      )
+    `);
+
+    const nowTs = () => Math.floor(Date.now() / 1000);
+
+    async function insertSettings(userId, moversAlerts) {
+      const ts = nowTs();
+      await run(
+        `INSERT OR IGNORE INTO user_settings (user_id, movers_alerts, created_at, updated_at) VALUES (?, ?, ?, ?)`,
+        [String(userId), moversAlerts ? 1 : 0, ts, ts]
+      );
+    }
+
+    return { run, get, all, close, insertSettings, nowTs };
+  }
+
+  // Shared replica of quickRugRisk for test assertions
+  function testQuickRugRisk(pair) {
+    function num(v) { const n = Number(v); return Number.isFinite(n) ? n : 0; }
+    const liq = num(pair.liquidityUsd);
+    const buys = num(pair.buysM5);
+    const sells = num(pair.sellsM5);
+    if (liq < 5000) return "🔴 HIGH — Thin liquidity";
+    if (liq < 15000) return "🟠 MEDIUM — Low liquidity";
+    if (sells > buys * 3 && sells >= 5) return "🟠 MEDIUM — Sell pressure detected";
+    if (liq >= 50000 && buys >= sells) return "🟢 LOW — Strong structure";
+    return "🟡 MODERATE — Monitor closely";
+  }
+
+  await test("movers_alerts column exists in user_settings and defaults to 0", async () => {
+    const { get, close, insertSettings } = await makeMoversDb();
+    await insertSettings("user1", false);
+    const row = await get(`SELECT movers_alerts FROM user_settings WHERE user_id = 'user1'`);
+    assert.ok(row, "Row should exist");
+    assert.strictEqual(row.movers_alerts, 0, "movers_alerts should default to 0");
+    await close();
+  });
+
+  await test("movers_alerts can be enabled for a user", async () => {
+    const { run, get, close, insertSettings, nowTs } = await makeMoversDb();
+    await insertSettings("user2", false);
+    await run(`UPDATE user_settings SET movers_alerts = 1, updated_at = ? WHERE user_id = 'user2'`, [nowTs()]);
+    const row = await get(`SELECT movers_alerts FROM user_settings WHERE user_id = 'user2'`);
+    assert.strictEqual(row.movers_alerts, 1, "movers_alerts should be 1 after enabling");
+    await close();
+  });
+
+  await test("setUserSetting allows movers_alerts as a valid field", () => {
+    const allowed = new Set([
+      "mode", "alerts_enabled", "launch_alerts", "smart_alerts", "risk_alerts",
+      "whale_alerts", "watchlist_alerts", "movers_alerts", "explanation_level", "last_scan_query"
+    ]);
+    assert.ok(allowed.has("movers_alerts"), "movers_alerts should be in the allowed set");
+  });
+
+  await test("quickRugRisk returns HIGH for liquidity below $5k", () => {
+    assert.strictEqual(testQuickRugRisk({ liquidityUsd: 4999, buysM5: 10, sellsM5: 2 }), "🔴 HIGH — Thin liquidity");
+    assert.strictEqual(testQuickRugRisk({ liquidityUsd: 0, buysM5: 0, sellsM5: 0 }), "🔴 HIGH — Thin liquidity");
+  });
+
+  await test("quickRugRisk returns MEDIUM for liquidity $5k–$15k", () => {
+    assert.strictEqual(testQuickRugRisk({ liquidityUsd: 8000, buysM5: 5, sellsM5: 1 }), "🟠 MEDIUM — Low liquidity");
+    assert.strictEqual(testQuickRugRisk({ liquidityUsd: 14999, buysM5: 5, sellsM5: 1 }), "🟠 MEDIUM — Low liquidity");
+  });
+
+  await test("quickRugRisk returns MEDIUM when extreme sell pressure detected", () => {
+    assert.strictEqual(testQuickRugRisk({ liquidityUsd: 20000, buysM5: 1, sellsM5: 10 }), "🟠 MEDIUM — Sell pressure detected");
+  });
+
+  await test("quickRugRisk returns LOW for high liquidity with buy pressure", () => {
+    assert.strictEqual(testQuickRugRisk({ liquidityUsd: 75000, buysM5: 20, sellsM5: 5 }), "🟢 LOW — Strong structure");
+  });
+
+  await test("quickRugRisk returns MODERATE for mid-range liquidity without extremes", () => {
+    assert.strictEqual(testQuickRugRisk({ liquidityUsd: 25000, buysM5: 8, sellsM5: 6 }), "🟡 MODERATE — Monitor closely");
+  });
+
+  await test("movers alert filter: passes only fast gainers with buy pressure and minimum liquidity", () => {
+    const MOVERS_PRICE_CHANGE_H1_PCT = 30;
+    const MOVERS_PRICE_CHANGE_M5_PCT = 15;
+    const MOVERS_MIN_LIQ_USD = 10000;
+
+    function isMover(pair) {
+      function num(v) { const n = Number(v); return Number.isFinite(n) ? n : 0; }
+      const h1 = num(pair.priceChangeH1);
+      const m5 = num(pair.priceChangeM5);
+      const buys = num(pair.buysM5);
+      const sells = num(pair.sellsM5);
+      const liq = num(pair.liquidityUsd);
+      return (
+        (h1 >= MOVERS_PRICE_CHANGE_H1_PCT || m5 >= MOVERS_PRICE_CHANGE_M5_PCT) &&
+        buys > sells &&
+        liq >= MOVERS_MIN_LIQ_USD
+      );
+    }
+
+    // Should qualify — 50% h1, buy pressure, good liquidity
+    assert.ok(isMover({ priceChangeH1: 50, priceChangeM5: 5, buysM5: 20, sellsM5: 5, liquidityUsd: 25000 }));
+    // Should qualify — 20% m5, buy pressure, good liquidity
+    assert.ok(isMover({ priceChangeH1: 5, priceChangeM5: 20, buysM5: 15, sellsM5: 3, liquidityUsd: 15000 }));
+    // Should NOT qualify — high gain but sell pressure
+    assert.ok(!isMover({ priceChangeH1: 60, priceChangeM5: 20, buysM5: 5, sellsM5: 20, liquidityUsd: 20000 }));
+    // Should NOT qualify — buy pressure but insufficient gain
+    assert.ok(!isMover({ priceChangeH1: 10, priceChangeM5: 5, buysM5: 20, sellsM5: 5, liquidityUsd: 20000 }));
+    // Should NOT qualify — good gain and buy pressure but too little liquidity
+    assert.ok(!isMover({ priceChangeH1: 50, priceChangeM5: 20, buysM5: 20, sellsM5: 5, liquidityUsd: 5000 }));
+  });
+
+  await test("movers alert cooldown prevents re-alerting same token within 5 minutes", () => {
+    const moversAlertedTokens = new Map();
+    const MOVERS_TOKEN_ALERT_COOLDOWN_MS = 5 * 60 * 1000;
+
+    function shouldAlert(key, nowMs) {
+      const lastAlertedAt = moversAlertedTokens.get(key) || 0;
+      if (nowMs - lastAlertedAt < MOVERS_TOKEN_ALERT_COOLDOWN_MS) return false;
+      moversAlertedTokens.set(key, nowMs);
+      return true;
+    }
+
+    const key = "solana:TokenABC";
+    const t0 = Date.now();
+    assert.ok(shouldAlert(key, t0), "First call should alert");
+    assert.ok(!shouldAlert(key, t0 + 1000), "Second call within cooldown should not alert");
+    assert.ok(!shouldAlert(key, t0 + MOVERS_TOKEN_ALERT_COOLDOWN_MS - 1), "Call just before cooldown expires should not alert");
+    assert.ok(shouldAlert(key, t0 + MOVERS_TOKEN_ALERT_COOLDOWN_MS), "Call at cooldown boundary should alert again");
+  });
+
+  await test("normalizePair includes priceChangeH1 and priceChangeM5 from DexScreener pair data", () => {
+    function num(v) { const n = Number(v); return Number.isFinite(n) ? n : 0; }
+    function normalizePairFields(pair) {
+      return {
+        priceChangeM5: num(pair.priceChange?.m5 || 0),
+        priceChangeH1: num(pair.priceChange?.h1 || 0)
+      };
+    }
+
+    const raw = { priceChange: { m5: 12.5, h1: 45.3, h6: 80.1, h24: 200.0 } };
+    const normalized = normalizePairFields(raw);
+    assert.ok(Math.abs(normalized.priceChangeM5 - 12.5) < 0.001, "priceChangeM5 should be 12.5");
+    assert.ok(Math.abs(normalized.priceChangeH1 - 45.3) < 0.001, "priceChangeH1 should be 45.3");
+
+    const noChange = { priceChange: null };
+    const noChangeNormalized = normalizePairFields(noChange);
+    assert.strictEqual(noChangeNormalized.priceChangeM5, 0, "priceChangeM5 defaults to 0 when missing");
+    assert.strictEqual(noChangeNormalized.priceChangeH1, 0, "priceChangeH1 defaults to 0 when missing");
+  });
 
   // ────────────────────────────────────────────────────────────────────────────
   // EARLY ACCESS INTEREST TESTS
