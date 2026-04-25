@@ -106,6 +106,13 @@ const launchAlertedTokens = new Map();
 const LAUNCH_TOKEN_ALERT_COOLDOWN_MS = 5 * 60 * 1000; // 5-min per token
 const LAUNCH_MAX_AGE_MINUTES = 1440;              // 24 h — max token age for launch radar
 
+// Movers alert tracking — tokens already alerted for rapid price movement
+const moversAlertedTokens = new Map();
+const MOVERS_TOKEN_ALERT_COOLDOWN_MS = 5 * 60 * 1000; // 5-min per token
+const MOVERS_PRICE_CHANGE_H1_PCT = 30;  // ≥30% 1-hour gain triggers mover alert
+const MOVERS_PRICE_CHANGE_M5_PCT = 15;  // ≥15% 5-min gain triggers mover alert
+const MOVERS_MIN_LIQ_USD = 10000;       // minimum liquidity for credibility
+
 // Watchlist monitor thresholds
 const WATCHLIST_ALERT_COOLDOWN_S = 5 * 60;       // 5-min cooldown per item between alerts
 const WATCHLIST_PRICE_ALERT_PCT = 5;              // ±5% price move triggers alert
@@ -118,6 +125,7 @@ const ALERT_SEND_DELAY_MS = 200;                 // delay between per-user Teleg
 // IDs of the background setInterval loops, stored so they can be cleared on shutdown.
 let _launchRadarIntervalId = null;
 let _watchlistMonitorIntervalId = null;
+let _moversAlertIntervalId = null;
 
 // ================= DB HELPERS =================
 function getSessionMemory(chatId) {
@@ -399,6 +407,7 @@ async function initDb() {
       risk_alerts INTEGER DEFAULT 0,
       whale_alerts INTEGER DEFAULT 0,
       watchlist_alerts INTEGER DEFAULT 0,
+      movers_alerts INTEGER DEFAULT 0,
       explanation_level TEXT DEFAULT 'deep',
       last_scan_query TEXT DEFAULT '',
       created_at INTEGER NOT NULL,
@@ -518,6 +527,10 @@ async function initDb() {
 
   try {
     await run(`ALTER TABLE user_settings ADD COLUMN watchlist_alerts INTEGER DEFAULT 0`);
+  } catch (_) {}
+
+  try {
+    await run(`ALTER TABLE user_settings ADD COLUMN movers_alerts INTEGER DEFAULT 0`);
   } catch (_) {}
 
   // ── Health monitoring tables ─────────────────────────────────────────────
@@ -1118,6 +1131,7 @@ async function getUserSettings(userId) {
     risk_alerts: 0,
     whale_alerts: 0,
     watchlist_alerts: 0,
+    movers_alerts: 0,
     explanation_level: "deep",
     last_scan_query: ""
   };
@@ -1132,6 +1146,7 @@ async function setUserSetting(userId, field, value) {
     "risk_alerts",
     "whale_alerts",
     "watchlist_alerts",
+    "movers_alerts",
     "explanation_level",
     "last_scan_query"
   ]);
@@ -1376,6 +1391,7 @@ function buildAlertCenterMenu(settings) {
         [{ text: `${mark(settings.launch_alerts)} 📡 Launch Radar Alerts`, callback_data: "toggle_setting:launch_alerts" }],
         [{ text: `${mark(settings.watchlist_alerts)} 👁 Watchlist Alerts`, callback_data: "toggle_setting:watchlist_alerts" }],
         [{ text: `${mark(settings.risk_alerts)} 🛡 Risk Alerts`, callback_data: "toggle_setting:risk_alerts" }],
+        [{ text: `${mark(settings.movers_alerts)} 🚀 Movers Alerts`, callback_data: "toggle_setting:movers_alerts" }],
         [{ text: "🔄 Refresh", callback_data: "refresh:alert_center" }],
         [{ text: "🏠 Main Menu", callback_data: "main_menu" }]
       ]
@@ -1596,6 +1612,8 @@ function normalizePair(pair) {
     txnsM5:
       num(pair.txns?.m5?.buys || pair.buysM5) +
       num(pair.txns?.m5?.sells || pair.sellsM5),
+    priceChangeM5: num(pair.priceChange?.m5 || 0),
+    priceChangeH1: num(pair.priceChange?.h1 || 0),
     marketCap: num(pair.marketCap || pair.fdv || pair.market_cap),
     fdv: num(pair.fdv),
     url: String(pair.url || ""),
@@ -3123,7 +3141,7 @@ async function showAlertCenter(chatId, userId) {
   const settings = await getUserSettings(userId);
   await sendText(
     chatId,
-    `🚨 <b>Alert Center</b>\n\nAutomatic background monitoring. Gorktimus runs continuous scans in the background and pushes real-time notifications when conditions are met. Toggle each alert layer below.\n\n📡 <b>Launch Radar Alerts</b>\nContinuously scans new token launches against live liquidity, volume, and structural thresholds. Fires an alert when qualifying launches are detected — maximum one alert cycle per minute.\n\n👁 <b>Watchlist Alerts</b>\nActive price surveillance on every token you have saved. Triggers when price moves ±5% or more from the last checkpoint, liquidity is suddenly drained, or early rug pull signals are detected simultaneously.\n\n🛡 <b>Risk Alerts</b>\nFires when a tracked token's structural risk score escalates into elevated territory based on live on-chain data.`,
+    `🚨 <b>Alert Center</b>\n\nAutomatic background monitoring. Gorktimus runs continuous scans in the background and pushes real-time notifications when conditions are met. Toggle each alert layer below.\n\n📡 <b>Launch Radar Alerts</b>\nContinuously scans new token launches against live liquidity, volume, and structural thresholds. Fires an alert when qualifying launches are detected — maximum one alert cycle per minute.\n\n👁 <b>Watchlist Alerts</b>\nActive price surveillance on every token you have saved. Triggers when price moves ±5% or more from the last checkpoint, liquidity is suddenly drained, or early rug pull signals are detected simultaneously.\n\n🛡 <b>Risk Alerts</b>\nFires when a tracked token's structural risk score escalates into elevated territory based on live on-chain data.\n\n🚀 <b>Movers Alerts</b>\nScans for tokens moving at a high rate of speed. Fires when a token gains 30%+ in the last hour or 15%+ in the last 5 minutes with confirmed buy pressure. Each alert shows buy pressure, current market rate, and a quick rug risk read.`,
     buildAlertCenterMenu(settings)
   );
 }
@@ -3935,6 +3953,148 @@ async function runWatchlistMonitor() {
   }
 }
 
+/**
+ * Returns a quick rug-risk label based purely on pair data available from DexScreener.
+ * Used in Movers Alert messages to give a fast structural read without running the full
+ * on-chain analysis (which would be too slow for a rapid-fire scan).
+ */
+function quickRugRisk(pair) {
+  const liq = num(pair.liquidityUsd);
+  const buys = num(pair.buysM5);
+  const sells = num(pair.sellsM5);
+  if (liq < 5000) return "🔴 HIGH — Thin liquidity";
+  if (liq < 15000) return "🟠 MEDIUM — Low liquidity";
+  if (sells > buys * 3 && sells >= 5) return "🟠 MEDIUM — Sell pressure detected";
+  if (liq >= 50000 && buys >= sells) return "🟢 LOW — Strong structure";
+  return "🟡 MODERATE — Monitor closely";
+}
+
+/**
+ * Scans for tokens that are moving fast (large 1-hour or 5-minute price gain with
+ * buy pressure) and alerts all users who have movers_alerts enabled.
+ * Called every 2 minutes.
+ */
+async function runMoversAlert() {
+  const userRows = await all(
+    `SELECT s.movers_alerts, u.chat_id
+     FROM user_settings s
+     JOIN users u ON u.user_id = s.user_id
+     WHERE s.movers_alerts = 1 AND u.chat_id IS NOT NULL AND u.chat_id != ''`
+  ).catch(() => []);
+
+  if (!userRows.length) return;
+
+  const alertTargets = DEV_MODE
+    ? userRows.filter(row => String(row.chat_id) === OWNER_USER_ID)
+    : userRows;
+
+  if (!alertTargets.length) return;
+
+  // Combine profiles and boosts as candidate token sources
+  const [profiles, boosts] = await Promise.all([
+    fetchLatestProfiles().catch(() => []),
+    fetchLatestBoosts().catch(() => [])
+  ]);
+
+  const seen = new Set();
+  const candidates = [];
+
+  for (const source of [profiles.slice(0, 50), boosts.slice(0, 30)]) {
+    for (const item of source) {
+      const chainId = String(item.chainId || "").toLowerCase();
+      const tokenAddress = String(item.tokenAddress || "");
+      if (!tokenAddress || !supportsChain(chainId)) continue;
+      const key = `${chainId}:${tokenAddress}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      candidates.push({ chainId, tokenAddress, key });
+    }
+  }
+
+  const now = Date.now();
+  const movers = [];
+
+  for (const c of candidates) {
+    if (movers.length >= 5) break;
+    const lastAlertedAt = moversAlertedTokens.get(c.key) || 0;
+    if (now - lastAlertedAt < MOVERS_TOKEN_ALERT_COOLDOWN_MS) continue;
+
+    const pair = await resolveTokenToBestPair(c.chainId, c.tokenAddress, true).catch(() => null);
+    if (!pair) continue;
+
+    const h1 = num(pair.priceChangeH1);
+    const m5 = num(pair.priceChangeM5);
+    const buys = num(pair.buysM5);
+    const sells = num(pair.sellsM5);
+    const liq = num(pair.liquidityUsd);
+
+    // Must have meaningful liquidity and be gaining fast with buy pressure
+    const isGainingFast = h1 >= MOVERS_PRICE_CHANGE_H1_PCT || m5 >= MOVERS_PRICE_CHANGE_M5_PCT;
+    const hasBuyPressure = buys > sells;
+    const hasLiquidity = liq >= MOVERS_MIN_LIQ_USD;
+
+    if (isGainingFast && hasBuyPressure && hasLiquidity) {
+      movers.push(pair);
+      moversAlertedTokens.set(c.key, now);
+    }
+  }
+
+  if (!movers.length) return;
+
+  for (const pair of movers) {
+    const symbol = escapeHtml(pair.baseSymbol || shortAddr(pair.baseAddress, 6));
+    const chain = escapeHtml(humanChain(pair.chainId));
+    const dexUrl = makeDexUrl(pair.chainId, pair.pairAddress, pair.url || "");
+    const h1 = num(pair.priceChangeH1);
+    const m5 = num(pair.priceChangeM5);
+    const buys = num(pair.buysM5);
+    const sells = num(pair.sellsM5);
+    const totalTxns = buys + sells;
+    const buyPressureLabel = totalTxns > 0
+      ? `${Math.round((buys / totalTxns) * 100)}% buy (${buys}B / ${sells}S in 5m)`
+      : `${buys}B / ${sells}S`;
+    const rugRisk = quickRugRisk(pair);
+
+    const lines = [
+      `🚀 <b>MOVERS ALERT</b>`,
+      ``,
+      `<b>${symbol}</b> is moving — ${chain}`,
+      ``,
+      `📈 <b>Price Change:</b> ${h1 >= MOVERS_PRICE_CHANGE_H1_PCT ? `+${toPct(h1)} (1h)` : `+${toPct(m5)} (5m)`}`,
+      `💵 <b>Current Rate:</b> ${shortUsd(pair.priceUsd)}`,
+      `📊 <b>Market Cap:</b> ${shortUsd(pair.marketCap)}`,
+      `💧 <b>Liquidity:</b> ${shortUsd(pair.liquidityUsd)}`,
+      `⚡ <b>Buy Pressure:</b> ${buyPressureLabel}`,
+      `🛡 <b>Rug Risk:</b> ${rugRisk}`,
+      ``,
+      `📍 <code>${escapeHtml(pair.baseAddress || "")}</code>`,
+      dexUrl ? `🔗 ${dexUrl}` : ""
+    ].filter(line => line !== "");
+
+    const alertText = lines.join("\n");
+    const safeAddress = String(pair.baseAddress || "").replace(/:/g, "");
+    const safeChain = String(pair.chainId || "").replace(/:/g, "");
+    const scanCb = `scan_direct:${safeChain}:${safeAddress}`;
+
+    const keyboard = {
+      reply_markup: {
+        inline_keyboard: [
+          [{ text: `🔎 Scan ${pair.baseSymbol || "Token"}`, callback_data: scanCb }],
+          [{ text: "🚀 Movers Alert", callback_data: "refresh:alert_center" }, { text: "🏠 Main Menu", callback_data: "main_menu" }]
+        ]
+      }
+    };
+
+    for (const row of alertTargets) {
+      if (!row.chat_id) continue;
+      await sendText(String(row.chat_id), alertText, keyboard).catch(() => {});
+      await sleep(ALERT_SEND_DELAY_MS);
+    }
+
+    console.log(`[movers-alert] Alerted ${alertTargets.length} user(s) about mover: ${pair.baseSymbol || pair.baseAddress}`);
+  }
+}
+
 // ================= BOOT =================
 (async () => {
   try {
@@ -3998,6 +4158,14 @@ async function runWatchlistMonitor() {
       }, 90000);
     }, 30000);
 
+    // Movers Alert: fire after 60 s then every 120 s
+    setTimeout(() => {
+      runMoversAlert().catch(() => {});
+      _moversAlertIntervalId = setInterval(() => {
+        runMoversAlert().catch((err) => console.log("[movers-alert] interval error:", err.message));
+      }, 120000);
+    }, 60000);
+
     console.log("✅ Background alert monitors started");
   } catch (err) {
     console.error("❌ Boot error:", err.message);
@@ -4008,6 +4176,7 @@ async function runWatchlistMonitor() {
 process.on("SIGINT", async () => {
   if (_launchRadarIntervalId) clearInterval(_launchRadarIntervalId);
   if (_watchlistMonitorIntervalId) clearInterval(_watchlistMonitorIntervalId);
+  if (_moversAlertIntervalId) clearInterval(_moversAlertIntervalId);
   await releaseInstanceLock().catch(() => {});
   try {
     db.close();
@@ -4018,6 +4187,7 @@ process.on("SIGINT", async () => {
 process.on("SIGTERM", async () => {
   if (_launchRadarIntervalId) clearInterval(_launchRadarIntervalId);
   if (_watchlistMonitorIntervalId) clearInterval(_watchlistMonitorIntervalId);
+  if (_moversAlertIntervalId) clearInterval(_moversAlertIntervalId);
   await releaseInstanceLock().catch(() => {});
   try {
     db.close();
