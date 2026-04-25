@@ -5,9 +5,11 @@
 // stores health metrics, and alerts the owner on critical failures.
 
 const SEVEN_HOURS_MS = 7 * 60 * 60 * 1000;
+const THIRTY_MINUTES_MS = 30 * 60 * 1000;
 const THIRTY_DAYS_S = 30 * 24 * 60 * 60;
 const MAX_MESSAGE_LENGTH = 2000;
 const MAX_STACK_LENGTH = 4000;
+const CRITICAL_ERROR_THRESHOLD = 10; // recent errors in 30 min that trigger a critical alert
 
 // Severity levels used when logging errors
 const SEVERITY = {
@@ -162,13 +164,78 @@ function initHealthMonitor({ bot, run, get, callbackStore, sessionMemory, ownerU
     console.log("[health-monitor] Maintenance cycle complete");
   }
 
-  // ── Interval ───────────────────────────────────────────────────────────────
+  // ── 30-minute system error scan ────────────────────────────────────────────
+
+  /**
+   * Scans for system errors every 30 minutes.
+   * - Counts unresolved error_logs from the last 30 minutes.
+   * - Verifies critical DB tables are accessible; re-creates them if missing.
+   * - Alerts the owner when the recent error rate is critical.
+   * - Logs the scan result to update_history so there's a full audit trail.
+   */
+  async function runSystemScan() {
+    console.log("[health-monitor] Running 30-minute system scan…");
+    const windowStart = nowTs() - 30 * 60;
+    let recentErrors = 0;
+    let tablesOk = true;
+
+    // Count errors logged in the last 30 minutes
+    try {
+      const row = await get(
+        `SELECT COUNT(*) AS cnt FROM error_logs WHERE ts >= ?`,
+        [windowStart]
+      );
+      recentErrors = row?.cnt || 0;
+    } catch (err) {
+      console.error("[health-monitor] System scan: error counting recent errors:", err.message);
+      tablesOk = false;
+    }
+
+    // Verify (and auto-correct) critical tables
+    try {
+      await ensureTables();
+    } catch (err) {
+      console.error("[health-monitor] System scan: ensureTables failed:", err.message);
+      await logError("System scan: ensureTables failed: " + err.message, err.stack, SEVERITY.CRITICAL);
+      tablesOk = false;
+    }
+
+    const scanNotes = `System scan: recent_errors=${recentErrors} tables_ok=${tablesOk}`;
+    console.log(`[health-monitor] ${scanNotes}`);
+
+    // Record the scan in update_history
+    try {
+      await run(
+        `INSERT INTO update_history (event_type, notes, ts) VALUES (?, ?, ?)`,
+        ["system_scan", scanNotes, nowTs()]
+      );
+    } catch (_) {}
+
+    // Alert the owner if the error rate is elevated or tables failed
+    const isCritical = recentErrors >= CRITICAL_ERROR_THRESHOLD || !tablesOk;
+    if (isCritical) {
+      await logError(scanNotes, "", SEVERITY.CRITICAL);
+      await alertOwner(
+        `⚠️ <b>Gorktimus System Scan Alert</b>\n\nRecent errors (30 min): <b>${recentErrors}</b>\nTables OK: <b>${tablesOk}</b>\n\nAuto-correction applied. Monitor for continued failures.`
+      );
+    }
+
+    console.log("[health-monitor] System scan complete");
+  }
+
+  // ── Intervals ──────────────────────────────────────────────────────────────
 
   const intervalId = setInterval(() => {
     runMaintenance().catch((err) => {
       console.error("[health-monitor] Unexpected error in maintenance:", err.message);
     });
   }, SEVEN_HOURS_MS);
+
+  const systemScanIntervalId = setInterval(() => {
+    runSystemScan().catch((err) => {
+      console.error("[health-monitor] Unexpected error in system scan:", err.message);
+    });
+  }, THIRTY_MINUTES_MS);
 
   // ── DB table initialisation ────────────────────────────────────────────────
   // Tables are created in initDb() inside index.js; this is just a guard.
@@ -208,6 +275,7 @@ function initHealthMonitor({ bot, run, get, callbackStore, sessionMemory, ownerU
 
   function stop() {
     clearInterval(intervalId);
+    clearInterval(systemScanIntervalId);
     process.off("uncaughtException", uncaughtHandler);
     process.off("unhandledRejection", rejectionHandler);
   }
@@ -229,9 +297,9 @@ function initHealthMonitor({ bot, run, get, callbackStore, sessionMemory, ownerU
       }
     });
 
-  console.log(`[health-monitor] Started. Maintenance cycle every 7 hours.`);
+  console.log(`[health-monitor] Started. Maintenance cycle every 7 hours. System scan every 30 minutes.`);
 
-  return { stop, logError, recordHealthSnapshot };
+  return { stop, logError, recordHealthSnapshot, runSystemScan };
 }
 
 module.exports = { initHealthMonitor, SEVERITY };

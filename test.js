@@ -169,6 +169,100 @@ async function main() {
     await close();
   });
 
+  await test("initHealthMonitor exposes runSystemScan function", async () => {
+    const { run, get, close } = await makeTestDb();
+    const monitor = initHealthMonitor({
+      bot: null,
+      run,
+      get,
+      callbackStore: new Map(),
+      sessionMemory: new Map(),
+      ownerUserId: "",
+      devMode: false
+    });
+    assert.strictEqual(typeof monitor.runSystemScan, "function");
+    monitor.stop();
+    await close();
+  });
+
+  await test("runSystemScan writes a system_scan event to update_history", async () => {
+    const { run, get, close } = await makeTestDb();
+    const monitor = initHealthMonitor({
+      bot: null,
+      run,
+      get,
+      callbackStore: new Map(),
+      sessionMemory: new Map(),
+      ownerUserId: "",
+      devMode: false
+    });
+
+    await monitor.runSystemScan();
+    await new Promise((r) => setTimeout(r, 50));
+
+    const row = await get(`SELECT * FROM update_history WHERE event_type = 'system_scan' ORDER BY id DESC LIMIT 1`);
+    assert.ok(row, "system_scan row should exist in update_history");
+    assert.strictEqual(row.event_type, "system_scan");
+    assert.ok(row.notes.includes("recent_errors"), "notes should include recent_errors count");
+    assert.ok(row.notes.includes("tables_ok"), "notes should include tables_ok status");
+
+    monitor.stop();
+    await close();
+  });
+
+  await test("runSystemScan correctly reports 0 recent errors on a fresh DB", async () => {
+    const { run, get, close } = await makeTestDb();
+    const monitor = initHealthMonitor({
+      bot: null,
+      run,
+      get,
+      callbackStore: new Map(),
+      sessionMemory: new Map(),
+      ownerUserId: "",
+      devMode: false
+    });
+
+    await monitor.runSystemScan();
+    await new Promise((r) => setTimeout(r, 50));
+
+    const row = await get(`SELECT * FROM update_history WHERE event_type = 'system_scan' ORDER BY id DESC LIMIT 1`);
+    assert.ok(row, "system_scan row should exist");
+    assert.ok(row.notes.includes("recent_errors=0"), "Fresh DB should report 0 recent errors");
+
+    monitor.stop();
+    await close();
+  });
+
+  await test("runSystemScan counts errors logged in the last 30 minutes", async () => {
+    const { run, get, close } = await makeTestDb();
+    const monitor = initHealthMonitor({
+      bot: null,
+      run,
+      get,
+      callbackStore: new Map(),
+      sessionMemory: new Map(),
+      ownerUserId: "",
+      devMode: false
+    });
+
+    // Log 3 recent errors
+    await monitor.logError("err1", "", "low");
+    await monitor.logError("err2", "", "medium");
+    await monitor.logError("err3", "", "critical");
+    await new Promise((r) => setTimeout(r, 50));
+
+    await monitor.runSystemScan();
+    await new Promise((r) => setTimeout(r, 50));
+
+    const row = await get(`SELECT * FROM update_history WHERE event_type = 'system_scan' ORDER BY id DESC LIMIT 1`);
+    assert.ok(row, "system_scan row should exist");
+    // The count includes boot snapshot errors plus our 3; what matters is it's > 0
+    assert.ok(!row.notes.includes("recent_errors=0"), "Should detect recently logged errors");
+
+    monitor.stop();
+    await close();
+  });
+
   await test("logError writes a row to error_logs", async () => {
     const { run, get, close } = await makeTestDb();
     const monitor = initHealthMonitor({
@@ -669,6 +763,26 @@ async function main() {
       assert.ok(
         Buffer.byteLength(cb, "utf8") <= 64,
         `Action "${action}" produces callback "${cb}" (${Buffer.byteLength(cb, "utf8")} bytes) exceeding 64-byte limit`
+      );
+    }
+  });
+
+  await test("scan_direct alert callbacks are within 64-byte limit for all supported chains", () => {
+    // scan_direct:chainId:tokenAddress — used in launch radar alert buttons
+    const cases = [
+      // Solana: 44-char base58 address
+      { chainId: "solana",   tokenAddress: "7tuPcPMUoDUxxb1j1NPjyjLXaqDwmxaW7mA2Y8Mbpump" },
+      // Ethereum: 42-char hex address
+      { chainId: "ethereum", tokenAddress: "0x1234567890abcdef1234567890abcdef12345678" },
+      // Base: 42-char hex address
+      { chainId: "base",     tokenAddress: "0xabcdef1234567890abcdef1234567890abcdef12" }
+    ];
+    for (const { chainId, tokenAddress } of cases) {
+      const cb = `scan_direct:${chainId}:${tokenAddress}`;
+      const bytes = Buffer.byteLength(cb, "utf8");
+      assert.ok(
+        bytes <= 64,
+        `scan_direct callback for ${chainId} is ${bytes} bytes — exceeds 64-byte Telegram limit`
       );
     }
   });

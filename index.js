@@ -2986,51 +2986,60 @@ async function showTrending(chatId, userId = null) {
 }
 
 async function showLaunchRadar(chatId) {
-  const profiles = await fetchLatestProfiles();
-  const candidates = [];
+  try {
+    const profiles = await fetchLatestProfiles().catch(() => []);
+    const candidates = [];
 
-  for (const p of profiles.slice(0, 50)) {
-    if (!supportsChain(p.chainId)) continue;
-    const pair = await resolveTokenToBestPair(p.chainId, p.tokenAddress, true);
-    if (!pair) continue;
+    for (const p of profiles.slice(0, 50)) {
+      if (!supportsChain(p.chainId)) continue;
+      const pair = await resolveTokenToBestPair(p.chainId, p.tokenAddress, true);
+      if (!pair) continue;
 
-    const ageMin = ageMinutesFromMs(pair.pairCreatedAt);
-    if (
-      pair.liquidityUsd >= LAUNCH_MIN_LIQ_USD &&
-      pair.volumeH24 >= LAUNCH_MIN_VOL_USD &&
-      ageMin <= LAUNCH_MAX_AGE_MINUTES
-    ) {
-      candidates.push(pair);
+      const ageMin = ageMinutesFromMs(pair.pairCreatedAt);
+      if (
+        pair.liquidityUsd >= LAUNCH_MIN_LIQ_USD &&
+        pair.volumeH24 >= LAUNCH_MIN_VOL_USD &&
+        ageMin <= LAUNCH_MAX_AGE_MINUTES
+      ) {
+        candidates.push(pair);
+      }
+
+      if (candidates.length >= 5) break;
     }
 
-    if (candidates.length >= 5) break;
-  }
+    if (!candidates.length) {
+      await sendText(
+        chatId,
+        `📡 <b>Launch Radar</b>\n\nNo fresh launches passed minimum live filters right now. Radar is still scanning — check back shortly.`,
+        buildMainMenuOnlyButton("refresh:launch_radar")
+      );
+      return;
+    }
 
-  if (!candidates.length) {
+    const lines = [
+      `📡 <b>Launch Radar</b>`,
+      ``,
+      `Gorktimus scans live launch data in real-time, filtering out the noise and surfacing only the earliest opportunities with verified liquidity, confirmed volume, and structural integrity worth watching.`,
+      ``
+    ];
+
+    for (const [index, pair] of candidates.entries()) {
+      lines.push(buildMiniSignalCard(pair, index + 1, "launch"));
+    }
+
     await sendText(
       chatId,
-      `📡 <b>Launch Radar</b>\n\nNo fresh launches passed minimum live filters right now. Radar is still scanning — check back shortly.`,
+      lines.join("\n\n"),
+      buildSignalListButtons(candidates, "refresh:launch_radar")
+    );
+  } catch (err) {
+    console.error("[launch-radar] showLaunchRadar error:", err.message);
+    await sendText(
+      chatId,
+      `📡 <b>Launch Radar</b>\n\nUnable to load radar data right now. Please try again shortly.`,
       buildMainMenuOnlyButton("refresh:launch_radar")
     );
-    return;
   }
-
-  const lines = [
-    `📡 <b>Launch Radar</b>`,
-    ``,
-    `Gorktimus scans live launch data in real-time, filtering out the noise and surfacing only the earliest opportunities with verified liquidity, confirmed volume, and structural integrity worth watching.`,
-    ``
-  ];
-
-  for (const [index, pair] of candidates.entries()) {
-    lines.push(buildMiniSignalCard(pair, index + 1));
-  }
-
-  await sendText(
-    chatId,
-    lines.join("\n\n"),
-    buildSignalListButtons(candidates, "refresh:launch_radar")
-  );
 }
 
 async function showPrimePicks(chatId) {
@@ -3722,19 +3731,42 @@ async function runLaunchRadarAlerts() {
     ``
   ];
 
+  // Build per-token scan buttons so the user can scan each token directly
+  // without waiting for a fresh radar re-scan.  scan_direct: callbacks are
+  // plain strings (no callbackStore dependency) and stay within Telegram's
+  // 64-byte callback_data limit for all supported chains.
+  const tokenRows = [];
   for (const [i, pair] of newLaunches.entries()) {
     const dexUrl = makeDexUrl(pair.chainId, pair.pairAddress, pair.url || "");
+    const flowLabel = pair.buysM5 > pair.sellsM5 ? "🟢" : "🔴";
     lines.push(
       `${i + 1}. <b>${escapeHtml(pair.baseSymbol || shortAddr(pair.baseAddress, 6))}</b> — ${escapeHtml(humanChain(pair.chainId))}` +
       `\n   💧 Liq: ${shortUsd(pair.liquidityUsd)} | 📊 Vol: ${shortUsd(pair.volumeH24)} | ⏳ ${ageFromMs(pair.pairCreatedAt)}` +
+      `\n   ${flowLabel} Flow: ${pair.buysM5}B / ${pair.sellsM5}S` +
       (dexUrl ? `\n   🔗 ${dexUrl}` : "")
     );
+    // scan_direct:chainId:tokenAddress — handled by the callback router without
+    // callbackStore so it never expires.  Strip any colons from the address as a
+    // safety measure (Solana base58 and EVM hex addresses never contain colons,
+    // but this ensures the split(":") in the callback router always works).
+    const safeAddress = String(pair.baseAddress || "").replace(/:/g, "");
+    const safeChain = String(pair.chainId || "").replace(/:/g, "");
+    const scanCb = `scan_direct:${safeChain}:${safeAddress}`;
+    const buttonLabel = pair.baseSymbol ? `🔎 Scan ${pair.baseSymbol}` : `🔎 Scan ${shortAddr(pair.baseAddress, 4)}`;
+    tokenRows.push([{ text: buttonLabel, callback_data: scanCb }]);
   }
 
-  lines.push(``, `Tap 📡 Launch Radar in the main menu to scan any of these.`);
+  lines.push(``, `Tap a Scan button below to run a full analysis on any of these tokens.`);
 
   const alertText = lines.join("\n");
-  const alertKeyboard = { reply_markup: { inline_keyboard: [[{ text: "📡 Launch Radar", callback_data: "launch_radar" }, { text: "🏠 Main Menu", callback_data: "main_menu" }]] } };
+  const alertKeyboard = {
+    reply_markup: {
+      inline_keyboard: [
+        ...tokenRows,
+        [{ text: "📡 Launch Radar", callback_data: "launch_radar" }, { text: "🏠 Main Menu", callback_data: "main_menu" }]
+      ]
+    }
+  };
 
   for (const row of userRows) {
     if (!row.chat_id) continue;
