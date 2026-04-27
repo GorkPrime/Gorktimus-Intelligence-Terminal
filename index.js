@@ -605,6 +605,15 @@ async function initDb() {
       clicked_at INTEGER NOT NULL
     )
   `);
+
+  // ── Referral tracking ─────────────────────────────────────────────────────
+  await run(`
+    CREATE TABLE IF NOT EXISTS referrals (
+      referee_id  TEXT    PRIMARY KEY,
+      referrer_id TEXT    NOT NULL,
+      created_at  INTEGER NOT NULL
+    )
+  `);
 }
 
 // ================= BASIC HELPERS =================
@@ -1211,6 +1220,69 @@ async function getNetworkPulse() {
   return `⚡ ${todayUsers?.c || 0} today • ${liveUsers?.c || 0} live • ${scansToday?.c || 0} scans`;
 }
 
+// ================= SOCIAL PROOF / REFERRAL / SIGNAL COUNT HELPERS =================
+
+async function getTokenCommunityScans(chainId, tokenAddress) {
+  try {
+    const since = nowTs() - 86400;
+    const row = await get(
+      `SELECT COUNT(DISTINCT user_id) AS c FROM user_scan_history WHERE chain_id = ? AND token_address = ? AND created_at >= ?`,
+      [String(chainId || ""), String(tokenAddress || ""), since]
+    );
+    return num(row?.c, 0);
+  } catch (_) {
+    return 0;
+  }
+}
+
+async function processReferral(refereeId, referrerId) {
+  if (!refereeId || !referrerId) return false;
+  if (String(refereeId) === String(referrerId)) return false; // no self-referral
+  try {
+    const existing = await get(`SELECT referee_id FROM referrals WHERE referee_id = ?`, [String(refereeId)]);
+    if (existing) return false; // already credited
+    await run(
+      `INSERT INTO referrals (referee_id, referrer_id, created_at) VALUES (?, ?, ?)`,
+      [String(refereeId), String(referrerId), nowTs()]
+    );
+    return true;
+  } catch (_) {
+    return false;
+  }
+}
+
+async function getReferralCount(userId) {
+  try {
+    const row = await get(`SELECT COUNT(*) AS c FROM referrals WHERE referrer_id = ?`, [String(userId)]);
+    return num(row?.c, 0);
+  } catch (_) {
+    return 0;
+  }
+}
+
+async function getMenuSignalCounts() {
+  try {
+    const profiles = latestProfilesCache.data || [];
+    const boosts = latestBoostsCache.data || [];
+    const launchSignals = Math.min(
+      profiles.filter(p => supportsChain(String(p.chainId || "").toLowerCase())).length,
+      99
+    );
+    const moversSignals = Math.min(
+      boosts.filter(b => supportsChain(String(b.chainId || "").toLowerCase())).length,
+      99
+    );
+    let watchlistActive = 0;
+    try {
+      const row = await get(`SELECT COUNT(*) AS c FROM watchlist WHERE active = 1 AND alerts_enabled = 1`);
+      watchlistActive = num(row?.c, 0);
+    } catch (_) {}
+    return { launchSignals, moversSignals, watchlistActive };
+  } catch (_) {
+    return { launchSignals: 0, moversSignals: 0, watchlistActive: 0 };
+  }
+}
+
 // ================= SUBSCRIPTION =================
 async function isUserSubscribed(userId) {
   if (!REQUIRED_CHANNEL) return true;
@@ -1276,7 +1348,10 @@ function getDevModeStatus() {
 }
 function buildMainMenu() {
   const growthRow = BOT_USERNAME
-    ? [{ text: "🚀 Invite Friends", callback_data: "invite_friends" }]
+    ? [
+        { text: "🚀 Invite Friends", callback_data: "invite_friends" },
+        { text: "🏆 My Referrals", callback_data: "my_referrals" }
+      ]
     : [];
 
   const keyboard = [
@@ -1468,12 +1543,20 @@ function buildScanActionButtons(pair, query = "") {
     tokenAddress: pair.baseAddress
   });
 
+  const shareSigCb = makeShortCallback("sharesig", {
+    chainId: pair.chainId,
+    tokenAddress: pair.baseAddress
+  });
+
   return {
     reply_markup: {
       inline_keyboard: [
         [
           { text: "👁 Add Watchlist", callback_data: watchAddCb },
           { text: "🔎 Scan Another", callback_data: "scan_token" }
+        ],
+        [
+          { text: "📤 Share Signal", callback_data: shareSigCb }
         ],
         [
           { text: "👍 Good Call", callback_data: feedbackGoodCb },
@@ -1509,6 +1592,8 @@ function buildMiniSignalCard(pair, index, mode = "standard") {
   const chain = escapeHtml(humanChain(pair.chainId));
   const address = escapeHtml(pair.baseAddress || "");
   const age = ageFromMs(pair.pairCreatedAt);
+  const ageMin = ageMinutesFromMs(pair.pairCreatedAt);
+  const isEarly = ageMin > 0 && ageMin < 10;
 
   let verdict = "Structure is being watched.";
   if (mode === "trending") {
@@ -1528,7 +1613,7 @@ function buildMiniSignalCard(pair, index, mode = "standard") {
         : "Qualified setup, but not top-tier depth yet.";
   }
 
-  return [
+  const lines = [
     `━━━━━━━━━━━━━━━`,
     `<b>${index}. <a href="${dexUrl}">${symbol}</a></b> • ${chain}`,
     `<code>${shortAddr(address, 6)}</code>`,
@@ -1536,7 +1621,13 @@ function buildMiniSignalCard(pair, index, mode = "standard") {
     `Liq: <b>${shortUsd(pair.liquidityUsd)}</b>   Vol: <b>${shortUsd(pair.volumeH24)}</b>`,
     `Flow: <b>${pair.buysM5}B / ${pair.sellsM5}S</b>   Age: <b>${age}</b>`,
     `<i>${escapeHtml(verdict)}</i>`
-  ].join("\n");
+  ];
+
+  if (mode === "launch" && isEarly) {
+    lines.push(`🔭 <b>Gorktimus detected early</b>`);
+  }
+
+  return lines.join("\n");
 }
 function buildSignalListButtons(items, refreshKey) {
   const rows = [];
@@ -2175,6 +2266,118 @@ function buildRecommendation(score, ageMin, pair, verdictMeta = {}) {
   return "Speculative setup. Treat this as a high-risk play until more data matures.";
 }
 
+// ================= GORKTIMUS VERDICT HELPERS =================
+
+function getGorktimusRiskLabel(score, verdictMeta = {}) {
+  if (verdictMeta.isHoneypot) return { label: "DANGER", emoji: "⛔" };
+  if (score >= 70) return { label: "SAFE", emoji: "✅" };
+  if (score >= 50) return { label: "WATCH", emoji: "⚠️" };
+  if (score >= 30) return { label: "RISKY", emoji: "🔴" };
+  return { label: "DANGER", emoji: "⛔" };
+}
+
+function getGorktimusAction(score, verdictMeta = {}) {
+  if (verdictMeta.isHoneypot) return "Avoid";
+  if (score >= 70) return "Strong watch";
+  if (score >= 55) return "Small size only";
+  if (score >= 35) return "Watch";
+  return "Avoid";
+}
+
+function buildGorktimusCall(pair, verdict) {
+  const score = verdict.score;
+  const liq = num(pair.liquidityUsd);
+  const ageMin = verdict.ageMin;
+  const isHoneypot = verdict.honeypotLabel === "Detected";
+  if (isHoneypot) return "Cannot sell — do not enter. This is a trap.";
+  if (score >= 75 && liq >= 100000) return "Solid structure with real depth. Clean setup worth watching.";
+  if (score >= 70 && liq >= 40000) return "Good structure. Liquidity is there — watch the momentum.";
+  if (score >= 60 && ageMin > 0 && ageMin < 30) return "Early, but structure is forming. Watch before sizing in.";
+  if (score >= 55 && liq < 30000) return "This has momentum, but liquidity is too thin for heavy size.";
+  if (score >= 50) return "Mixed signals. Interesting but not clean enough to rush.";
+  if (liq < 10000) return "Liquidity is dangerously thin. Exit path could trap you.";
+  if (score < 30) return "Too many red flags stacking. Risk does not justify entry.";
+  return "Caution warranted. Structural concerns outweigh the opportunity here.";
+}
+
+function buildWhyItMatters(pair, verdict) {
+  const score = verdict.score;
+  const liq = num(pair.liquidityUsd);
+  const holderLabel = verdict.holderLabel;
+  const honeypotLabel = verdict.honeypotLabel;
+  const liquidityLock = verdict.liquidityLock;
+  const ageMin = verdict.ageMin;
+  if (honeypotLabel === "Detected") return "Honeypot simulation failed. Selling may be impossible.";
+  if (liq < 5000) return "Liquidity is near zero — a single seller could collapse the price.";
+  if (holderLabel === "Very High") return "Supply is dangerously concentrated. Dev wallet risk is extreme.";
+  if (score >= 70 && liquidityLock?.status === "locked") return "Liquidity is locked and structure looks clean. Lower rug risk.";
+  if (score >= 65) return "Multiple signals align positively. Risk is below average for this class.";
+  if (ageMin > 0 && ageMin < 10) return "Token is under 10 minutes old. Structure has not formed — treat it as ultra-speculative.";
+  if (liq < 20000) return "Thin liquidity means your exit moves the market. Position size matters.";
+  if (score < 35) return "Multiple structural weaknesses compound. High probability of a bad outcome.";
+  return "Risk profile sits in moderate territory. Proceed with clear size discipline.";
+}
+
+function buildGorktimusVerdictSection(pair, verdict, communityScans = 0) {
+  const isHoneypot = verdict.honeypotLabel === "Detected";
+  const riskLabel = getGorktimusRiskLabel(verdict.score, { isHoneypot });
+  const action = getGorktimusAction(verdict.score, { isHoneypot });
+  const call = buildGorktimusCall(pair, verdict);
+  const why = buildWhyItMatters(pair, verdict);
+  const ageMin = verdict.ageMin;
+  const isEarlySignal = ageMin > 0 && ageMin < 10;
+
+  const lines = [
+    `⚡ <b>GORKTIMUS VERDICT</b>`,
+    ``,
+    `${riskLabel.emoji} <b>Risk Level: ${riskLabel.label}</b>`,
+    ``,
+    `"${escapeHtml(call)}"`,
+    ``,
+    `💡 <b>Why it matters:</b> ${escapeHtml(why)}`,
+    `🎯 <b>Action:</b> ${escapeHtml(action)}`
+  ];
+
+  if (isEarlySignal) {
+    lines.push(``, `🔭 <b>Gorktimus detected early</b> — Signal age: ${escapeHtml(ageFromMs(pair.pairCreatedAt))}`);
+  }
+
+  if (communityScans > 0) {
+    lines.push(``, `👥 <b>Community scans today:</b> ${communityScans}`);
+  }
+
+  lines.push(``, `⏱ <i>Last refreshed: now</i>`, ``, `━━━━━━━━━━━━━━━━━━━━━━━━`);
+  return lines.join("\n");
+}
+
+function buildShareText(pair, verdict, dexUrl = "") {
+  const isHoneypot = verdict.honeypotLabel === "Detected";
+  const riskLabel = getGorktimusRiskLabel(verdict.score, { isHoneypot });
+  const action = getGorktimusAction(verdict.score, { isHoneypot });
+  const call = buildGorktimusCall(pair, verdict);
+  const symbol = String(pair.baseSymbol || "TOKEN").toUpperCase().replace(/[^A-Z0-9]/g, "");
+  const chain = humanChain(pair.chainId);
+  const lines = [
+    `⚡ GORKTIMUS SIGNAL`,
+    ``,
+    `$${symbol} | ${chain}`,
+    `Safety: ${verdict.score}/99 | ${riskLabel.label}`,
+    `Liq: ${shortUsd(pair.liquidityUsd)} | Vol: ${shortUsd(pair.volumeH24)}`,
+    ``,
+    `"${call}"`,
+    ``,
+    `Action: ${action}`,
+    ``,
+    `Scanned by Gorktimus Intelligence Terminal`
+  ];
+  if (dexUrl) lines.push(dexUrl);
+  return lines.join("\n");
+}
+
+function buildXIntentUrl(shareText) {
+  return `https://twitter.com/intent/tweet?text=${encodeURIComponent(shareText)}`;
+}
+
 async function buildRiskVerdict(pair, userId = null) {
   const ageMin = ageMinutesFromMs(pair.pairCreatedAt);
   const liquidity = getLiquidityHealth(pair.liquidityUsd);
@@ -2377,9 +2580,13 @@ async function buildScanCard(pair, heading, userId = null) {
   const dexUrl = makeDexUrl(pair.chainId, pair.pairAddress, pair.url);
   const birdeyeUrl = makeBirdeyeUrl(pair.chainId, pair.baseAddress);
   const geckoUrl = makeGeckoUrl(pair.chainId, pair.pairAddress);
+  const communityScans = await getTokenCommunityScans(pair.chainId, pair.baseAddress).catch(() => 0);
+  const verdictSection = buildGorktimusVerdictSection(pair, verdict, communityScans);
 
   return [
     `🧠 <b>Gorktimus Intelligence Terminal</b>`,
+    ``,
+    verdictSection,
     ``,
     `${heading}`,
     ``,
@@ -2615,9 +2822,17 @@ function buildAssistantGenericReply(prompt = "") {
 // ================= SCREENS =================
 async function showMainMenu(chatId) {
   const pulse = await getNetworkPulse();
+  const counts = await getMenuSignalCounts().catch(() => ({ launchSignals: 0, moversSignals: 0, watchlistActive: 0 }));
+
+  const countsLine = [];
+  if (counts.launchSignals > 0) countsLine.push(`📡 ${counts.launchSignals} on radar`);
+  if (counts.moversSignals > 0) countsLine.push(`🚀 ${counts.moversSignals} movers`);
+  if (counts.watchlistActive > 0) countsLine.push(`👁 ${counts.watchlistActive} watching`);
+  const statusLine = countsLine.length > 0 ? `\n${countsLine.join(" • ")}` : "";
+
   await sendMenu(
     chatId,
-    `🧠 <b>Gorktimus Intelligence Terminal</b> ${getDevModeStatus()}\n\n${pulse}\n\nLive intelligence. On-demand execution.\nNo clutter. No spam.\n\nSelect an operation below.`,
+    `🧠 <b>Gorktimus Intelligence Terminal</b> ${getDevModeStatus()}\n\n${pulse}${statusLine}\n\nLive intelligence. On-demand execution.\nNo clutter. No spam.\n\nSelect an operation below.`,
     buildMainMenu()
   );
 }
@@ -2638,20 +2853,52 @@ async function showWhaleMenu(chatId) {
   );
 }
 
-async function showInviteFriends(chatId) {
-  const botLink = buildBotDeepLink();
+async function showInviteFriends(chatId, userId = null) {
+  const refLink = BOT_USERNAME && userId
+    ? `https://t.me/${BOT_USERNAME}?start=ref_${userId}`
+    : BOT_USERNAME ? `https://t.me/${BOT_USERNAME}` : "";
+
+  const referralCount = userId ? await getReferralCount(userId).catch(() => 0) : 0;
+
   const text = [
     `🧠 <b>Gorktimus Intelligence Terminal</b>`,
     ``,
     `🚀 <b>Invite Friends</b>`,
     ``,
-    botLink ? `Share this bot link:\n${escapeHtml(botLink)}` : `Bot username not detected yet.`,
+    refLink
+      ? `Your personal invite link:\n<code>${escapeHtml(refLink)}</code>`
+      : `Bot username not detected yet.`,
+    ``,
+    referralCount > 0
+      ? `🏆 You have invited <b>${referralCount}</b> user${referralCount !== 1 ? "s" : ""} so far.`
+      : `Share your link — every referral is tracked.`,
     ``,
     `X Community: ${escapeHtml(COMMUNITY_X_URL)}`,
     `Telegram Community: ${escapeHtml(COMMUNITY_TELEGRAM_URL)}`
   ].join("\n");
 
   await sendText(chatId, text, buildMainMenuOnlyButton("refresh:invite"));
+}
+
+async function showMyReferrals(chatId, userId) {
+  const count = await getReferralCount(userId).catch(() => 0);
+  const refLink = BOT_USERNAME && userId
+    ? `https://t.me/${BOT_USERNAME}?start=ref_${userId}`
+    : "";
+
+  const text = [
+    `🏆 <b>My Referrals</b>`,
+    ``,
+    `You have invited <b>${count}</b> user${count !== 1 ? "s" : ""} to Gorktimus.`,
+    ``,
+    refLink
+      ? `Your invite link:\n<code>${escapeHtml(refLink)}</code>`
+      : ``,
+    ``,
+    `Every new user who starts the bot through your link is counted here.`
+  ].filter(Boolean).join("\n");
+
+  await sendText(chatId, text, buildMainMenuOnlyButton("refresh:main"));
 }
 
 async function logEarlyAccessInterest(userId, username) {
@@ -3242,18 +3489,28 @@ async function handleRefresh(chatId, userId, key) {
   if (key === "edge_brain") return showEdgeBrain(chatId);
   if (key === "wallets") return sendText(chatId, `🧠 <b>Wallet tracker</b> has been retired.`, buildMainMenuOnlyButton("refresh:main"));
   if (key === "ai") return showAIAssistant(chatId);
-  if (key === "invite") return showInviteFriends(chatId);
+  if (key === "invite") return showInviteFriends(chatId, userId);
 }
 
 
 // ================= COMMANDS =================
-bot.onText(/\/start/, async (msg) => {
+bot.onText(/\/start(.*)/, async (msg, match) => {
   try {
     if (!msg?.from?.id || !msg?.chat?.id) return;
     const ok = await ensureSubscribedOrBlock(msg);
     await upsertUserFromMessage(msg, ok ? 1 : 0);
     await ensureUserSettings(msg.from.id);
     await trackUserActivity(msg.from.id);
+
+    // Parse referral parameter from deep link (?start=ref_USERID)
+    const param = String(match?.[1] || "").trim();
+    if (param.startsWith("ref_")) {
+      const referrerId = param.slice(4).trim();
+      if (referrerId) {
+        await processReferral(String(msg.from.id), referrerId).catch(() => {});
+      }
+    }
+
     if (!ok) return;
     await showMainMenu(msg.chat.id);
   } catch (err) {
@@ -3453,7 +3710,8 @@ bot.on("callback_query", async (query) => {
 }
     if (data === "help_menu") return showHelpMenu(chatId);
     if (data === "whale_menu") return sendWhaleTrackerRetired(chatId);
-    if (data === "invite_friends") return showInviteFriends(chatId);
+    if (data === "invite_friends") return showInviteFriends(chatId, userId);
+    if (data === "my_referrals") return showMyReferrals(chatId, userId);
     if (data === "check_subscription") return showMainMenu(chatId);
     if (data === "early_access") {
       try {
@@ -3641,6 +3899,36 @@ if (data.startsWith("feedbackbad:")) {
   const verdict = await buildRiskVerdict(pair, userId);
   await addScanFeedback(userId, pair, "bad", verdict.score);
   return sendText(chatId, `🧠 <b>Feedback Saved</b>\n\nMarked as: <b>bad</b>`, buildMainMenuOnlyButton());
+}
+
+if (data.startsWith("sharesig:")) {
+  const payload = getShortCallbackPayload(data);
+  if (!payload) {
+    return sendText(chatId, `Share callback expired. Please rescan the token.`, buildMainMenuOnlyButton());
+  }
+  const pair = await resolveTokenToBestPair(payload.chainId, payload.tokenAddress).catch(() => null);
+  if (!pair) {
+    return sendText(chatId, `Could not resolve token for sharing.`, buildMainMenuOnlyButton());
+  }
+  const verdict = await buildRiskVerdict(pair, userId).catch(() => null);
+  if (!verdict) {
+    return sendText(chatId, `Could not compute verdict for sharing.`, buildMainMenuOnlyButton());
+  }
+  const dexUrl = makeDexUrl(pair.chainId, pair.pairAddress, pair.url);
+  const shareText = buildShareText(pair, verdict, dexUrl);
+  const xUrl = buildXIntentUrl(shareText);
+  return sendText(
+    chatId,
+    `📤 <b>Your Signal Card</b>\n\nTap the text below to copy, then post to X:\n\n<code>${escapeHtml(shareText)}</code>`,
+    {
+      reply_markup: {
+        inline_keyboard: [
+          [{ text: "📣 Post to X", url: xUrl }],
+          [{ text: "🏠 Main Menu", callback_data: "main_menu" }]
+        ]
+      }
+    }
+  );
 }
     if (data.startsWith("watch_add:")) {
       const [, chainId, tokenAddress] = data.split(":");
